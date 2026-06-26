@@ -1,7 +1,8 @@
 'use client'
-import { useState, useEffect, Suspense } from 'react'
+import { useState, useEffect, Suspense, useRef } from 'react'
 import { useSearchParams, useRouter } from 'next/navigation'
 import { Chess as ChessEngine, Square } from 'chess.js'
+import { publishEvent, fetchEventHistory, OnlineConnection } from '../lib/online'
 
 // Map chess piece types and colors to unicode symbols
 const PIECE_SYMBOLS: Record<string, string> = {
@@ -16,11 +17,18 @@ function ChessContent() {
   const p1 = decodeURIComponent(searchParams.get('p1') || 'Player 1')
   const p2 = decodeURIComponent(searchParams.get('p2') || 'Player 2')
 
+  const mode = searchParams.get('mode')?.trim() === 'bot'
+  const difficulty = searchParams.get('difficulty')?.trim() || 'medium'
+
+  const isOnline = searchParams.get('mode')?.trim() === 'online'
+  const room = searchParams.get('room')?.trim()?.toUpperCase()
+  const role = searchParams.get('role')?.trim()
+
   // Board FEN state
   const [fen, setFen] = useState('rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1')
   const [selectedSquare, setSelectedSquare] = useState<Square | null>(null)
   const [possibleMoves, setPossibleMoves] = useState<Square[]>([])
-  const [autoFlip, setAutoFlip] = useState(true)
+  const [autoFlip, setAutoFlip] = useState(false)
   const [log, setLog] = useState('White (Player 1) to make the first move.')
   const [promotionSquare, setPromotionSquare] = useState<{ from: Square; to: Square } | null>(null)
 
@@ -28,6 +36,14 @@ function ChessContent() {
   const [resignedWinner, setResignedWinner] = useState<string | null>(null) // 'w' | 'b' | null
   const [scores, setScores] = useState({ w: 0, b: 0 })
   const [draws, setDraws] = useState(0)
+  const [isBotThinking, setIsBotThinking] = useState(false)
+  const [isMoveInFlight, setIsMoveInFlight] = useState(false)
+
+  // Online status states
+  const [onlineStatus, setOnlineStatus] = useState<'connected' | 'connecting' | 'disconnected'>('disconnected')
+  const [isLoadingHistory, setIsLoadingHistory] = useState(isOnline)
+  const connectionRef = useRef<any>(null)
+  const processedIdsRef = useRef<Set<string>>(new Set())
 
   // Chess.js engine instancing
   const game = new ChessEngine(fen)
@@ -36,12 +52,118 @@ function ChessContent() {
   const isCheck = game.inCheck()
   const activeColor = game.turn() // 'w' or 'b'
 
+  const isMyTurn = !isOnline || (role === 'host' && activeColor === 'w') || (role && role.startsWith('guest') && activeColor === 'b')
+
   const currentPlayerName = activeColor === 'w' ? p1 : p2
   const opponentPlayerName = activeColor === 'w' ? p2 : p1
 
+  // Simple evaluation function based on material values
+  function evaluateChessBoard(engine: ChessEngine, botColor: 'w' | 'b'): number {
+    let score = 0
+    const pieceValues: Record<string, number> = { p: 10, n: 30, b: 30, r: 50, q: 90, k: 900 }
+    
+    const board = engine.board()
+    for (let r = 0; r < 8; r++) {
+      for (let c = 0; c < 8; c++) {
+        const piece = board[r][c]
+        if (piece) {
+          const val = pieceValues[piece.type] || 0
+          if (piece.color === botColor) {
+            score += val
+          } else {
+            score -= val
+          }
+        }
+      }
+    }
+    return score
+  }
+
+  // Minimax with Alpha-Beta pruning
+  function chessMinimax(engine: ChessEngine, depth: number, alpha: number, beta: number, isMaximizing: boolean, botColor: 'w' | 'b'): number {
+    if (depth === 0 || engine.isGameOver()) {
+      return evaluateChessBoard(engine, botColor)
+    }
+
+    const moves = engine.moves()
+    if (isMaximizing) {
+      let maxEval = -Infinity
+      for (const move of moves) {
+        engine.move(move)
+        const evaluation = chessMinimax(engine, depth - 1, alpha, beta, false, botColor)
+        engine.undo()
+        maxEval = Math.max(maxEval, evaluation)
+        alpha = Math.max(alpha, evaluation)
+        if (beta <= alpha) break
+      }
+      return maxEval
+    } else {
+      let minEval = Infinity
+      for (const move of moves) {
+        engine.move(move)
+        const evaluation = chessMinimax(engine, depth - 1, alpha, beta, true, botColor)
+        engine.undo()
+        minEval = Math.min(minEval, evaluation)
+        beta = Math.min(beta, evaluation)
+        if (beta <= alpha) break
+      }
+      return minEval
+    }
+  }
+
+  function findBestChessMove(engine: ChessEngine, botColor: 'w' | 'b', depth: number): any {
+    const moves = engine.moves({ verbose: true }) as any[]
+    let bestMove = null
+    let bestValue = -Infinity
+
+    const shuffledMoves = [...moves].sort(() => Math.random() - 0.5)
+
+    for (const move of shuffledMoves) {
+      engine.move({ from: move.from, to: move.to, promotion: 'q' })
+      const boardValue = chessMinimax(engine, depth - 1, -Infinity, Infinity, false, botColor)
+      engine.undo()
+
+      if (boardValue > bestValue) {
+        bestValue = boardValue
+        bestMove = move
+      }
+    }
+    return bestMove
+  }
+
+  // Trigger bot move
+  useEffect(() => {
+    if (!mode || isGameOver || promotionSquare) return
+    const isBotTurn = currentPlayerName === 'Bot'
+    if (isBotTurn) {
+      setIsBotThinking(true)
+      const delay = Math.floor(Math.random() * 400) + 300 // 300 to 700 ms
+      const timer = setTimeout(() => {
+        const botColor = activeColor
+        const engineCopy = new ChessEngine(fen)
+        let move = null
+
+        if (difficulty === 'easy') {
+          const moves = engineCopy.moves({ verbose: true })
+          move = moves[Math.floor(Math.random() * moves.length)]
+        } else if (difficulty === 'medium') {
+          move = findBestChessMove(engineCopy, botColor, 1)
+        } else {
+          move = findBestChessMove(engineCopy, botColor, 3)
+        }
+
+        if (move) {
+          makeMove(move.from, move.to, move.promotion || 'q')
+        }
+        setIsBotThinking(false)
+      }, delay)
+      return () => clearTimeout(timer)
+    }
+  }, [fen, isGameOver, promotionSquare, mode])
+
   // Cell click logic
   function handleCellClick(square: Square) {
-    if (isGameOver || promotionSquare) return
+    if (isGameOver || promotionSquare || isBotThinking || (mode && currentPlayerName === 'Bot') || (isOnline && !isMyTurn) || isLoadingHistory || isMoveInFlight) return
 
     const piece = game.get(square)
 
@@ -73,8 +195,15 @@ function ChessContent() {
     }
   }
 
+  function handlePromoSelection(promotionPiece: string) {
+    if (isMoveInFlight) return
+    if (promotionSquare) {
+      makeMove(promotionSquare.from, promotionSquare.to, promotionPiece)
+    }
+  }
+
   // Execute chess move
-  function makeMove(from: Square, to: Square, promotionPiece = 'q') {
+  function makeMoveLocally(from: Square, to: Square, promotionPiece = 'q') {
     try {
       game.move({ from, to, promotion: promotionPiece })
       const newFen = game.fen()
@@ -104,30 +233,198 @@ function ChessContent() {
     }
   }
 
-  // Resignation action
-  function handleResign() {
-    if (isGameOver) return
-    const winnerColor = activeColor === 'w' ? 'b' : 'w'
-    setResignedWinner(winnerColor)
-    setScores(prev => ({ ...prev, [winnerColor]: prev[winnerColor] + 1 }))
-    setLog(`RESIGNATION! ${winnerColor === 'w' ? p1 : p2} wins by resignation.`)
+  // Execute chess move
+  function makeMove(from: Square, to: Square, promotionPiece = 'q') {
+    if (isOnline) {
+      try {
+        // Move on local engine copy to compute state
+        game.move({ from, to, promotion: promotionPiece })
+        const newFen = game.fen()
+
+        let nextScores = { ...scores }
+        let nextDraws = draws
+        let nextLog = ''
+        
+        if (game.isGameOver()) {
+          if (game.isCheckmate()) {
+            const winnerColor = game.turn() === 'w' ? 'b' : 'w'
+            nextScores[winnerColor] = (scores[winnerColor as 'w' | 'b'] || 0) + 1
+            nextLog = `CHECKMATE! ${winnerColor === 'w' ? p1 : p2} wins!`
+          } else {
+            nextDraws = draws + 1
+            nextLog = 'DRAW / STALEMATE!'
+          }
+        } else if (game.inCheck()) {
+          nextLog = `CHECK! ${opponentPlayerName}'s turn. Protect the King.`
+        } else {
+          nextLog = `Moved ${from.toUpperCase()} to ${to.toUpperCase()}. It is now ${opponentPlayerName}'s turn.`
+        }
+
+        const nextState = {
+          fen: newFen,
+          scores: nextScores,
+          draws: nextDraws,
+          resignedWinner: null,
+          log: nextLog
+        }
+
+        // Restore previous fen locally to prevent optimistic update before SSE echo
+        game.load(fen)
+
+        setSelectedSquare(null)
+        setPossibleMoves([])
+        setPromotionSquare(null)
+
+        console.log('[CHESS] Outgoing update:', nextState)
+        setIsMoveInFlight(true)
+        publishEvent(room!, 'state_update', nextState)
+          .catch(() => setIsMoveInFlight(false))
+      } catch (err) {
+        console.error(err)
+      }
+    } else {
+      makeMoveLocally(from, to, promotionPiece)
+    }
   }
 
-  // Promotion choice selection
-  function handlePromoSelection(pieceType: string) {
-    if (!promotionSquare) return
-    makeMove(promotionSquare.from, promotionSquare.to, pieceType)
+  // Resignation action
+  function handleResign(isIncoming = false) {
+    if (isMoveInFlight) return
+    if (isOnline) {
+      const winnerColor = activeColor === 'w' ? 'b' : 'w'
+      const nextScores = { ...scores, [winnerColor]: (scores[winnerColor as 'w' | 'b'] || 0) + 1 }
+      const nextState = {
+        fen: fen,
+        scores: nextScores,
+        draws: draws,
+        resignedWinner: winnerColor,
+        log: `RESIGNATION! ${winnerColor === 'w' ? p1 : p2} wins by resignation.`
+      }
+      console.log('[CHESS] Outgoing resignation update:', nextState)
+      setIsMoveInFlight(true)
+      publishEvent(room!, 'state_update', nextState)
+        .catch(() => setIsMoveInFlight(false))
+    } else {
+      if (isGameOver) return
+      const winnerColor = activeColor === 'w' ? 'b' : 'w'
+      setResignedWinner(winnerColor)
+      setScores(prev => ({ ...prev, [winnerColor]: prev[winnerColor] + 1 }))
+      setLog(`RESIGNATION! ${winnerColor === 'w' ? p1 : p2} wins by resignation.`)
+    }
   }
 
   // Rematch reset
-  function resetGame() {
-    setFen('rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1')
-    setSelectedSquare(null)
-    setPossibleMoves([])
-    setPromotionSquare(null)
-    setResignedWinner(null)
-    setLog('Game reset! White (Player 1) to start.')
+  function resetGame(isIncoming = false) {
+    if (isOnline) {
+      const nextState = {
+        fen: 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1',
+        scores: scores,
+        draws: draws,
+        resignedWinner: null,
+        log: 'Game reset! White (Player 1) to start.'
+      }
+      console.log('[CHESS] Outgoing reset update:', nextState)
+      setIsMoveInFlight(true)
+      publishEvent(room!, 'state_update', nextState)
+        .catch(() => setIsMoveInFlight(false))
+    } else {
+      setFen('rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1')
+      setSelectedSquare(null)
+      setPossibleMoves([])
+      setPromotionSquare(null)
+      setResignedWinner(null)
+      setLog('Game reset! White (Player 1) to start.')
+    }
   }
+
+  // Online connection useEffect
+  useEffect(() => {
+    if (!isOnline || !room) return
+
+    const processedIds = new Set<string>()
+    processedIdsRef.current = processedIds
+
+    async function initOnline() {
+      setIsLoadingHistory(true)
+      const history = await fetchEventHistory(room!)
+      console.log('[CHESS] Fetched history:', history)
+
+      const stateUpdateEvents = history.filter(e => e.type === 'state_update')
+      let initialRoomStateApplied = false
+
+      if (stateUpdateEvents.length > 0) {
+        const latestEvent = stateUpdateEvents[stateUpdateEvents.length - 1]
+        const state = latestEvent.payload
+        console.log('[CHESS] Reconstructed state from history:', state)
+
+        game.load(state.fen)
+        setFen(state.fen)
+        setResignedWinner(state.resignedWinner)
+        setScores(state.scores)
+        setDraws(state.draws)
+        setLog(state.log)
+        initialRoomStateApplied = true
+      }
+
+      if (!initialRoomStateApplied && role === 'host') {
+        const initialState = {
+          fen: 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1',
+          scores: { w: 0, b: 0 },
+          draws: 0,
+          resignedWinner: null,
+          log: 'Game reset! White (Player 1) to start.'
+        }
+        console.log('[CHESS] Host publishing initial room state:', initialState)
+        publishEvent(room!, 'state_update', initialState)
+
+        game.load(initialState.fen)
+        setFen(initialState.fen)
+        setResignedWinner(initialState.resignedWinner)
+        setScores(initialState.scores)
+        setDraws(initialState.draws)
+        setLog(initialState.log)
+      }
+
+      for (const event of history) {
+        processedIds.add(event.id)
+      }
+
+      setIsLoadingHistory(false)
+
+      // Establish live listener
+      const conn = new OnlineConnection(
+        room!,
+        (event) => {
+          console.log('[CHESS] Live event callback:', event)
+          if (event.type === 'state_update') {
+            const state = event.payload
+            console.log('[CHESS] Applying live state update:', state)
+            setIsMoveInFlight(false)
+            game.load(state.fen)
+            setFen(state.fen)
+            setResignedWinner(state.resignedWinner)
+            setScores(state.scores)
+            setDraws(state.draws)
+            setLog(state.log)
+          }
+        },
+        (status) => setOnlineStatus(status),
+        processedIds,
+        true
+      )
+
+      connectionRef.current = conn
+      conn.connect()
+    }
+
+    initOnline()
+
+    return () => {
+      if (connectionRef.current) {
+        connectionRef.current.disconnect()
+      }
+    }
+  }, [isOnline, room])
 
   // Board layout rotation coordinates
   const isFlipped = autoFlip && activeColor === 'b' && !isGameOver
@@ -164,6 +461,28 @@ function ChessContent() {
         textShadow: '0 0 20px #a78bfa',
         marginBottom: 16, marginTop: 0,
       }}>ARCADE CHESS</h1>
+
+      {/* Online Status Header */}
+      {isOnline && (
+        <div style={{
+          background: '#11112b', border: `1px solid ${onlineStatus === 'connected' ? '#00ff88' : '#ef4444'}`,
+          borderRadius: 14, padding: '8px 16px', marginBottom: 12, display: 'flex', alignItems: 'center', gap: 8,
+          boxShadow: `0 0 10px ${onlineStatus === 'connected' ? '#00ff8822' : '#ef444422'}`,
+          width: '100%', maxWidth: 340, boxSizing: 'border-box'
+        }}>
+          <span style={{
+            width: 8, height: 8, borderRadius: '50%',
+            background: onlineStatus === 'connected' ? '#00ff88' : '#ef4444',
+            boxShadow: `0 0 8px ${onlineStatus === 'connected' ? '#00ff88' : '#ef4444'}`
+          }} />
+          <span style={{ color: '#fff', fontSize: 10, letterSpacing: 1, textTransform: 'uppercase', fontWeight: 'bold' }}>
+            {onlineStatus === 'connected' ? `ONLINE (ROOM: ${room})` : 'RECONNECTING...'}
+          </span>
+          <span style={{ color: '#666', fontSize: 10, marginLeft: 'auto', textTransform: 'uppercase', fontWeight: 'bold' }}>
+            {role === 'host' ? 'WHITE' : 'BLACK'}
+          </span>
+        </div>
+      )}
 
       {/* Scoreboard */}
       <div style={{ display: 'flex', gap: 10, marginBottom: 16, width: '100%', maxWidth: 340 }}>
@@ -225,7 +544,7 @@ function ChessContent() {
       <div style={{ height: 26, display: 'flex', alignItems: 'center', marginBottom: 12 }}>
         {!isGameOver && (
           <p style={{ color: currentColor, fontSize: 11, letterSpacing: 2, textTransform: 'uppercase', margin: 0, fontWeight: 'bold' }}>
-            ▶ {currentPlayerName}'S TURN
+            {isBotThinking ? '🤖 Bot is thinking...' : `▶ ${currentPlayerName}'S TURN`}
           </p>
         )}
       </div>
@@ -234,7 +553,7 @@ function ChessContent() {
       <div style={{
         width: '100%',
         maxWidth: 340,
-        aspectRatio: '1',
+        height: 'auto',
         border: '3px solid #a78bfa',
         borderRadius: 12,
         padding: 4,
@@ -247,10 +566,11 @@ function ChessContent() {
         {/* Render Grid */}
         <div style={{
           display: 'grid',
-          gridTemplateColumns: 'repeat(8, 1fr)',
-          gridTemplateRows: 'repeat(8, 1fr)',
+          gridTemplateColumns: 'repeat(8, minmax(0, 1fr))',
+          gridTemplateRows: 'repeat(8, minmax(0, 1fr))',
           width: '100%',
-          height: '100%',
+          aspectRatio: '1 / 1',
+          boxSizing: 'border-box',
         }}>
           {displayRanks.map((rank) =>
             displayFiles.map((file) => {
@@ -280,7 +600,7 @@ function ChessContent() {
                     display: 'flex',
                     alignItems: 'center',
                     justifyContent: 'center',
-                    fontSize: 34,
+                    fontSize: 'calc((min(340px, 90vw) - 14px) / 8 * 0.8)',
                     cursor: isGameOver ? 'default' : 'pointer',
                     userSelect: 'none',
                     transition: 'background 0.2s',
@@ -398,7 +718,7 @@ function ChessContent() {
         {/* Gameplay Buttons */}
         <div style={{ display: 'flex', gap: 10 }}>
           {!isGameOver ? (
-            <button onClick={handleResign} className="btn-touch" style={{
+            <button onClick={() => handleResign(false)} className="btn-touch" style={{
               flex: 1, padding: '14px',
               background: 'transparent',
               border: '2px solid #ef4444',
@@ -413,7 +733,7 @@ function ChessContent() {
               🏳️ RESIGN
             </button>
           ) : (
-            <button onClick={resetGame} className="btn-touch" style={{
+            <button onClick={() => resetGame(false)} className="btn-touch" style={{
               flex: 1, padding: '14px',
               background: 'transparent',
               border: '2px solid #00ff88',
@@ -478,7 +798,7 @@ function ChessContent() {
               )}
             </p>
             <div style={{ display: 'flex', gap: 10 }}>
-              <button onClick={resetGame} className="btn-touch" style={{
+              <button onClick={() => resetGame(false)} className="btn-touch" style={{
                 flex: 1, padding: '14px 12px',
                 background: 'transparent',
                 border: '2px solid #00ff88',
@@ -511,6 +831,18 @@ function ChessContent() {
         </div>
       )}
 
+      {isLoadingHistory && (
+        <div style={{
+          position: 'fixed', inset: 0, background: 'rgba(10, 10, 26, 0.95)',
+          display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', zIndex: 1000
+        }}>
+          <div style={{ fontSize: 40, marginBottom: 12 }} className="dot-pulse" />
+          <p style={{ color: '#fff', fontSize: 12, letterSpacing: 2, fontWeight: 'bold', textTransform: 'uppercase' }}>
+            SYNCHRONIZING BOARD STATE...
+          </p>
+        </div>
+      )}
+
       <style jsx global>{`
         .btn-touch {
           transition: transform 0.1s ease, filter 0.1s ease !important;
@@ -520,6 +852,19 @@ function ChessContent() {
         .btn-touch:active {
           transform: scale(0.94) !important;
           filter: brightness(0.9) !important;
+        }
+        @keyframes pulse {
+          0%, 100% { opacity: 0.3; }
+          50% { opacity: 1; }
+        }
+        .dot-pulse {
+          width: 24px;
+          height: 24px;
+          border-radius: 50%;
+          background: #00ff88;
+          display: inline-block;
+          animation: pulse 1.5s infinite ease-in-out;
+          box-shadow: 0 0 16px #00ff88;
         }
       `}</style>
     </main>

@@ -1,6 +1,7 @@
 'use client'
-import { useState, useEffect, Suspense } from 'react'
+import { useState, useEffect, Suspense, useRef } from 'react'
 import { useSearchParams, useRouter } from 'next/navigation'
+import { publishEvent, fetchEventHistory, OnlineConnection, getSessionPlayerId } from '../lib/online'
 
 // --- ARCADE NEON BOARD CONFIGURATION ---
 const ARCADE_THEME = {
@@ -366,12 +367,43 @@ function SnakeLadderContent() {
     return initial
   })
 
+  const mode = searchParams.get('mode')?.trim() === 'bot'
+  const isOnline = searchParams.get('mode')?.trim() === 'online'
+  const room = searchParams.get('room')?.trim()?.toUpperCase()
+  const role = searchParams.get('role')?.trim()
+
   const [currentPlayerIdx, setCurrentPlayerIdx] = useState(0)
   const [diceVal, setDiceVal] = useState<number | null>(null)
   const [isRolling, setIsRolling] = useState(false)
   const [isMoving, setIsMoving] = useState(false)
   const [logs, setLogs] = useState<string[]>(['Welcome to Snakes & Ladders!', 'Roll the dice to start the climb!'])
   const [winner, setWinner] = useState<string | null>(null)
+  const [isBotThinking, setIsBotThinking] = useState(false)
+  const [isMoveInFlight, setIsMoveInFlight] = useState(false)
+
+  // Online status states
+  const [onlineStatus, setOnlineStatus] = useState<'connected' | 'connecting' | 'disconnected'>('disconnected')
+  const [isLoadingHistory, setIsLoadingHistory] = useState(isOnline)
+  const connectionRef = useRef<any>(null)
+  const processedIdsRef = useRef<Set<string>>(new Set())
+
+  const myRoleIdx = role === 'host' ? 0 : role ? parseInt(role.replace('guest', '')) : -1
+  const isMyTurn = !isOnline || (currentPlayerIdx === myRoleIdx)
+
+  // Auto roll for bot
+  useEffect(() => {
+    if (!mode || winner || isRolling || isMoving) return
+    const isBotTurn = activePlayers[currentPlayerIdx]?.displayName === 'Bot'
+    if (isBotTurn) {
+      setIsBotThinking(true)
+      const delay = Math.floor(Math.random() * 400) + 300 // 300 to 700 ms
+      const timer = setTimeout(() => {
+        setIsBotThinking(false)
+        rollDice()
+      }, delay)
+      return () => clearTimeout(timer)
+    }
+  }, [currentPlayerIdx, isRolling, isMoving, winner, mode])
 
   const activeSnakes: { [key: number]: number } = boardTheme === 'retro' ? RETRO_THEME.snakes : ARCADE_THEME.snakes
   const activeLadders: { [key: number]: number } = boardTheme === 'retro' ? RETRO_THEME.ladders : ARCADE_THEME.ladders
@@ -388,8 +420,48 @@ function SnakeLadderContent() {
     setCurrentPlayerIdx(prev => (prev + 1) % playerCount)
   }
 
-  function rollDice() {
-    if (isRolling || isMoving || winner) return
+  async function executeMovementAnimation(targetState: any) {
+    const player = activePlayers[currentPlayerIdx]
+    const startPos = playerPositions[player.id]
+    const endPos = targetState.playerPositions[player.id]
+
+    setIsMoving(true)
+    setLogs(targetState.logs)
+
+    if (endPos > startPos) {
+      let intermediate = endPos
+      for (let x = startPos + 1; x <= 100; x++) {
+        if (activeLadders[x] === endPos || activeSnakes[x] === endPos) {
+          intermediate = x
+          break
+        }
+      }
+
+      for (let p = startPos + 1; p <= intermediate; p++) {
+        setPlayerPositions(prev => ({ ...prev, [player.id]: p }))
+        await new Promise(resolve => setTimeout(resolve, 250))
+      }
+
+      if (intermediate !== endPos) {
+        await new Promise(resolve => setTimeout(resolve, 800))
+        setPlayerPositions(prev => ({ ...prev, [player.id]: endPos }))
+      }
+    } else {
+      setPlayerPositions(prev => ({ ...prev, [player.id]: endPos }))
+    }
+
+    setIsMoving(false)
+    
+    // Reconcile complete state
+    setPlayerPositions(targetState.playerPositions)
+    setCurrentPlayerIdx(targetState.currentPlayerIdx)
+    setWinner(targetState.winner)
+  }
+
+  function rollDice(incomingRoll?: number, targetState?: any) {
+    if (isRolling || isMoving || winner || isMoveInFlight) return
+
+    if (isOnline && incomingRoll === undefined && !isMyTurn) return
 
     setIsRolling(true)
     let rollInterval = setInterval(() => {
@@ -398,11 +470,83 @@ function SnakeLadderContent() {
 
     setTimeout(async () => {
       clearInterval(rollInterval)
-      const finalVal = Math.floor(Math.random() * 6) + 1
+      const finalVal = incomingRoll !== undefined ? incomingRoll : Math.floor(Math.random() * 6) + 1
       setDiceVal(finalVal)
       setIsRolling(false)
 
-      await handlePlayerMove(finalVal)
+      if (isOnline) {
+        if (incomingRoll === undefined) {
+          // Compute the next state
+          const player = activePlayers[currentPlayerIdx]
+          const currentPos = playerPositions[player.id]
+          
+          let nextPositions = { ...playerPositions }
+          let nextPlayerIdx = currentPlayerIdx
+          let nextWinner = null
+          let nextLogs = [...logs]
+
+          const addLogOffline = (msg: string) => {
+            nextLogs = [msg, ...nextLogs].slice(0, 5)
+          }
+
+          addLogOffline(`🎲 ${player.displayName} rolled a ${finalVal}!`)
+
+          if (currentPos + finalVal > 100) {
+            addLogOffline(`⚠️ Roll too high! ${player.displayName} needs exactly ${100 - currentPos} to win.`)
+            nextPlayerIdx = (currentPlayerIdx + 1) % playerCount
+          } else {
+            let pos = currentPos + finalVal
+            let didClimb = false
+            let didSlide = false
+            let intermediate = pos
+
+            if (activeLadders[pos]) {
+              pos = activeLadders[pos]
+              didClimb = true
+            } else if (activeSnakes[pos]) {
+              pos = activeSnakes[pos]
+              didSlide = true
+            }
+
+            nextPositions[player.id] = pos
+
+            if (didClimb) {
+              addLogOffline(`🪜 Climb! ${player.displayName} climbed a ladder from ${intermediate} to ${pos}!`)
+            } else if (didSlide) {
+              addLogOffline(`🐍 Slide! ${player.displayName} was bitten by a snake at ${intermediate} and slid to ${pos}!`)
+            }
+
+            if (pos === 100) {
+              nextWinner = player.displayName
+              addLogOffline(`🏆 ${player.displayName} reached 100 and WON THE GAME!`)
+            } else {
+              if (finalVal !== 6) {
+                nextPlayerIdx = (currentPlayerIdx + 1) % playerCount
+              } else {
+                addLogOffline(`🎲 Extra Roll! ${player.displayName} gets another turn for rolling a 6!`)
+              }
+            }
+          }
+
+          const nextState = {
+            playerPositions: nextPositions,
+            currentPlayerIdx: nextPlayerIdx,
+            winner: nextWinner,
+            logs: nextLogs,
+            diceVal: finalVal
+          }
+
+          console.log('[SNAKES-LADDERS] Outgoing state update:', nextState)
+          setIsMoveInFlight(true)
+          publishEvent(room!, 'state_update', { state: nextState, roll: finalVal })
+            .catch(() => setIsMoveInFlight(false))
+        } else if (targetState) {
+          await executeMovementAnimation(targetState)
+        }
+      } else {
+        // Offline gameplay
+        await handlePlayerMove(finalVal)
+      }
     }, 800)
   }
 
@@ -412,7 +556,6 @@ function SnakeLadderContent() {
 
     addLog(`🎲 ${player.displayName} rolled a ${roll}!`)
 
-    // Exact Roll Rule: If roll would take you past 100, do not move
     if (currentPos + roll > 100) {
       addLog(`⚠️ Roll too high! ${player.displayName} needs exactly ${100 - currentPos} to win.`)
       await new Promise(resolve => setTimeout(resolve, 1500))
@@ -422,7 +565,6 @@ function SnakeLadderContent() {
 
     setIsMoving(true)
 
-    // Move token step by step
     let pos = currentPos
     for (let i = 1; i <= roll; i++) {
       pos++
@@ -430,7 +572,6 @@ function SnakeLadderContent() {
       await new Promise(resolve => setTimeout(resolve, 250))
     }
 
-    // Check for Snake or Ladder landing
     if (activeLadders[pos]) {
       const endPos = activeLadders[pos]
       addLog(`🪜 Climb! ${player.displayName} climbed a ladder from ${pos} to ${endPos}!`)
@@ -445,7 +586,6 @@ function SnakeLadderContent() {
       pos = endPos
     }
 
-    // Check for win
     if (pos === 100) {
       setWinner(player.displayName)
       addLog(`🏆 ${player.displayName} reached 100 and WON THE GAME!`)
@@ -455,7 +595,6 @@ function SnakeLadderContent() {
 
     setIsMoving(false)
 
-    // Optional Rule: Extra turn if rolling a 6
     if (roll === 6) {
       addLog(`🎲 Extra Roll! ${player.displayName} gets another turn for rolling a 6!`)
     } else {
@@ -463,17 +602,134 @@ function SnakeLadderContent() {
     }
   }
 
-  function resetGame() {
-    const initial: { [playerId: string]: number } = {}
-    activePlayers.forEach(p => {
-      initial[p.id] = 0
-    })
-    setPlayerPositions(initial)
-    setCurrentPlayerIdx(0)
-    setDiceVal(null)
-    setWinner(null)
-    setLogs(['Game reset! Roll to start the climb.'])
+  function resetGame(isIncoming = false) {
+    if (isOnline) {
+      const initial: { [playerId: string]: number } = {}
+      activePlayers.forEach(p => {
+        initial[p.id] = 0
+      })
+      const initialState = {
+        playerPositions: initial,
+        currentPlayerIdx: 0,
+        diceVal: null,
+        winner: null,
+        logs: ['Game reset! Roll to start the climb.']
+      }
+      console.log('[SNAKES-LADDERS] Outgoing reset state:', initialState)
+      setIsMoveInFlight(true)
+      publishEvent(room!, 'state_update', { state: initialState })
+        .catch(() => setIsMoveInFlight(false))
+    } else {
+      const initial: { [playerId: string]: number } = {}
+      activePlayers.forEach(p => {
+        initial[p.id] = 0
+      })
+      setPlayerPositions(initial)
+      setCurrentPlayerIdx(0)
+      setDiceVal(null)
+      setWinner(null)
+      setLogs(['Game reset! Roll to start the climb.'])
+    }
   }
+
+  useEffect(() => {
+    if (!isOnline || !room) return
+
+    const processedIds = new Set<string>()
+    processedIdsRef.current = processedIds
+
+    async function initOnline() {
+      setIsLoadingHistory(true)
+      const history = await fetchEventHistory(room!)
+      console.log('[SNAKES-LADDERS] Fetched history:', history)
+
+      const stateUpdateEvents = history.filter(e => e.type === 'state_update')
+      let initialRoomStateApplied = false
+
+      if (stateUpdateEvents.length > 0) {
+        const latestEvent = stateUpdateEvents[stateUpdateEvents.length - 1]
+        const state = latestEvent.payload.state
+        console.log('[SNAKES-LADDERS] Reconstructed state from history:', state)
+
+        setPlayerPositions(state.playerPositions)
+        setCurrentPlayerIdx(state.currentPlayerIdx)
+        setDiceVal(state.diceVal)
+        setWinner(state.winner)
+        setLogs(state.logs)
+        initialRoomStateApplied = true
+      }
+
+      if (!initialRoomStateApplied && role === 'host') {
+        const initial: { [playerId: string]: number } = {}
+        activePlayers.forEach(p => {
+          initial[p.id] = 0
+        })
+        const initialState = {
+          playerPositions: initial,
+          currentPlayerIdx: 0,
+          diceVal: null,
+          winner: null,
+          logs: ['Game reset! Roll to start the climb.']
+        }
+        console.log('[SNAKES-LADDERS] Host publishing initial room state:', initialState)
+        publishEvent(room!, 'state_update', { state: initialState })
+
+        setPlayerPositions(initialState.playerPositions)
+        setCurrentPlayerIdx(initialState.currentPlayerIdx)
+        setDiceVal(initialState.diceVal)
+        setWinner(initialState.winner)
+        setLogs(initialState.logs)
+      }
+
+      for (const event of history) {
+        processedIds.add(event.id)
+      }
+
+      setIsLoadingHistory(false)
+
+      const conn = new OnlineConnection(
+        room!,
+        (event) => {
+          console.log('[SNAKES-LADDERS] Live event callback:', event)
+          if (event.type === 'state_update') {
+            const { state, roll } = event.payload
+            setIsMoveInFlight(false)
+            if (roll !== undefined) {
+              if (event.sender === getSessionPlayerId()) {
+                // We already rolled locally, just run movement animation directly
+                setDiceVal(state.diceVal)
+                executeMovementAnimation(state)
+              } else {
+                console.log('[SNAKES-LADDERS] Roll received, playing animation:', roll, state)
+                rollDice(roll, state)
+              }
+            } else {
+              console.log('[SNAKES-LADDERS] Reset received, applying state:', state)
+              setPlayerPositions(state.playerPositions)
+              setCurrentPlayerIdx(state.currentPlayerIdx)
+              setDiceVal(state.diceVal)
+              setWinner(state.winner)
+              setLogs(state.logs)
+            }
+          }
+        },
+        (status) => setOnlineStatus(status),
+        processedIds,
+        true
+      )
+
+      connectionRef.current = conn
+      conn.connect()
+    }
+
+    initOnline()
+
+    return () => {
+      if (connectionRef.current) {
+        connectionRef.current.disconnect()
+      }
+    }
+  }, [isOnline, room])
 
   // Render 100 cells on the board
   const cells = []
@@ -536,6 +792,29 @@ function SnakeLadderContent() {
           </div>
         )}
       </div>
+
+      {/* Online Status Header */}
+      {isOnline && (
+        <div style={{
+          background: boardTheme === 'retro' ? '#fafaf9' : '#11112b',
+          border: `1px solid ${onlineStatus === 'connected' ? '#00ff88' : '#ef4444'}`,
+          borderRadius: 14, padding: '8px 16px', marginBottom: 12, display: 'flex', alignItems: 'center', gap: 8,
+          boxShadow: `0 0 10px ${onlineStatus === 'connected' ? '#00ff8822' : '#ef444422'}`,
+          width: '100%', maxWidth: 380, boxSizing: 'border-box'
+        }}>
+          <span style={{
+            width: 8, height: 8, borderRadius: '50%',
+            background: onlineStatus === 'connected' ? '#00ff88' : '#ef4444',
+            boxShadow: `0 0 8px ${onlineStatus === 'connected' ? '#00ff88' : '#ef4444'}`
+          }} />
+          <span style={{ color: boardTheme === 'retro' ? '#444' : '#fff', fontSize: 10, letterSpacing: 1, textTransform: 'uppercase', fontWeight: 'bold' }}>
+            {onlineStatus === 'connected' ? `ONLINE (ROOM: ${room})` : 'RECONNECTING...'}
+          </span>
+          <span style={{ color: '#666', fontSize: 10, marginLeft: 'auto', textTransform: 'uppercase', fontWeight: 'bold' }}>
+            {role === 'host' ? 'P1 (HOST)' : `GUEST ${myRoleIdx}`}
+          </span>
+        </div>
+      )}
 
       {/* Theme Selector Toggle */}
       <div style={{
@@ -912,20 +1191,20 @@ function SnakeLadderContent() {
               }}>
                 {isTurn ? (
                   <button
-                    onClick={rollDice}
-                    disabled={isRolling || isMoving}
+                    onClick={() => rollDice()}
+                    disabled={isRolling || isMoving || isMoveInFlight || (mode && player.displayName === 'Bot')}
                     className="btn-touch"
                     style={{
                       width: '100%', height: '100%',
-                      background: isPlayerTurnToRoll 
+                      background: isPlayerTurnToRoll && !(mode && player.displayName === 'Bot')
                         ? (boardTheme === 'retro' ? `linear-gradient(135deg, #f59e0b, #d97706)` : `linear-gradient(135deg, ${player.color}, ${player.color}cc)`)
                         : '#ffffff',
                       border: 'none', borderRadius: 9,
-                      color: isPlayerTurnToRoll ? '#ffffff' : (boardTheme === 'retro' ? '#78350f' : player.color),
-                      fontSize: diceVal ? 30 : 22,
+                      color: isPlayerTurnToRoll && !(mode && player.displayName === 'Bot') ? '#ffffff' : (boardTheme === 'retro' ? '#78350f' : player.color),
+                      fontSize: (isBotThinking || isPlayerRolling) ? 22 : (diceVal ? 30 : 22),
                       display: 'flex', alignItems: 'center', justifyContent: 'center',
-                      cursor: isRolling || isMoving ? 'default' : 'pointer',
-                      boxShadow: isPlayerTurnToRoll 
+                      cursor: isRolling || isMoving || isMoveInFlight || (mode && player.displayName === 'Bot') ? 'default' : 'pointer',
+                      boxShadow: isPlayerTurnToRoll && !(mode && player.displayName === 'Bot')
                         ? (boardTheme === 'retro' ? '0 3px 6px rgba(217, 119, 6, 0.4)' : `0 0 8px ${player.color}88`) 
                         : 'none',
                       transform: isPlayerRolling ? 'rotate(360deg)' : 'none',
@@ -935,7 +1214,7 @@ function SnakeLadderContent() {
                       WebkitTapHighlightColor: 'transparent',
                     }}
                   >
-                    {isPlayerRolling ? '🎲' : (diceVal ? DICE_FACES[diceVal - 1] : '🎲')}
+                    {isBotThinking ? '🤖' : (isPlayerRolling ? '🎲' : (diceVal ? DICE_FACES[diceVal - 1] : '🎲'))}
                   </button>
                 ) : (
                   <span style={{ fontSize: 16, color: boardTheme === 'retro' ? '#d6d3d1' : '#374151', opacity: 0.5 }}>🎲</span>
@@ -974,7 +1253,7 @@ function SnakeLadderContent() {
               {winner.toUpperCase()} IS THE CHAMPION!
             </p>
             <div style={{ display: 'flex', gap: 10 }}>
-              <button onClick={resetGame} className="btn-touch" style={{
+              <button onClick={() => resetGame(false)} className="btn-touch" style={{
                 flex: 1, padding: '14px 12px',
                 background: 'transparent',
                 border: boardTheme === 'retro' ? '2px solid #78350f' : '2px solid #f43f5e',
@@ -1011,7 +1290,7 @@ function SnakeLadderContent() {
       {/* Action Footer */}
       {!winner && (
         <div style={{ display: 'flex', gap: 14, marginTop: 4 }}>
-          <button onClick={resetGame} className="btn-touch" style={{
+          <button onClick={() => resetGame(false)} className="btn-touch" style={{
             background: 'transparent',
             border: boardTheme === 'retro' ? '2px dashed #78350f' : '1px dashed #334155',
             borderRadius: 8, padding: '12px 20px',
@@ -1038,6 +1317,18 @@ function SnakeLadderContent() {
         </div>
       )}
 
+      {isLoadingHistory && (
+        <div style={{
+          position: 'fixed', inset: 0, background: 'rgba(10, 10, 26, 0.95)',
+          display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', zIndex: 1000
+        }}>
+          <div style={{ fontSize: 40, marginBottom: 12 }} className="dot-pulse" />
+          <p style={{ color: '#fff', fontSize: 12, letterSpacing: 2, fontWeight: 'bold', textTransform: 'uppercase' }}>
+            SYNCHRONIZING BOARD STATE...
+          </p>
+        </div>
+      )}
+
       <style jsx global>{`
         @keyframes pulse-goal {
           from { transform: scale(0.95); text-shadow: 0 0.5px 2px rgba(234, 179, 8, 0.4); }
@@ -1051,6 +1342,19 @@ function SnakeLadderContent() {
         .btn-touch:active {
           transform: scale(0.94) !important;
           filter: brightness(0.9) !important;
+        }
+        @keyframes pulse {
+          0%, 100% { opacity: 0.3; }
+          50% { opacity: 1; }
+        }
+        .dot-pulse {
+          width: 24px;
+          height: 24px;
+          border-radius: 50%;
+          background: #00ff88;
+          display: inline-block;
+          animation: pulse 1.5s infinite ease-in-out;
+          box-shadow: 0 0 16px #00ff88;
         }
       `}</style>
     </main>

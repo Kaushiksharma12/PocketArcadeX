@@ -1,6 +1,7 @@
 'use client'
 import { useSearchParams, useRouter } from 'next/navigation'
-import { Suspense } from 'react'
+import { Suspense, useEffect, useState, useRef } from 'react'
+import { publishEvent, OnlineConnection } from '../lib/online'
 
 const games = [
   { id:'tictactoe', name:'TIC TAC TOE',  emoji:'✖️',  description:'Classic 3x3 battle',   players:'2 players',   minPlayers:2, maxPlayers:2, color:'#00f0ff', available:true  },
@@ -25,10 +26,100 @@ function GamesContent() {
   const filteredGames   = games.filter(g => playerCount>=g.minPlayers && playerCount<=g.maxPlayers)
   const incompatible    = games.filter(g => playerCount<g.minPlayers  || playerCount>g.maxPlayers)
 
+  const mode = searchParams.get('mode')?.trim()
+  const room = searchParams.get('room')?.trim()?.toUpperCase()
+  const role = searchParams.get('role')?.trim()
+  const isOnline = mode === 'online'
+
+  const [onlineStatus, setOnlineStatus] = useState<'connected' | 'connecting' | 'disconnected'>('disconnected')
+  const connectionRef = useRef<any>(null)
+  const processedIdsRef = useRef<Set<string>>(new Set())
+
+  // Connect to room if online mode
+  useEffect(() => {
+    if (!isOnline || !room) return
+
+    const processedIds = new Set<string>()
+    processedIdsRef.current = processedIds
+
+    // Fetch history first to check if host already selected a game
+    const topic = `pocket-arcade-x-room-${room.toUpperCase()}`
+    fetch(`https://ntfy.sh/${topic}/json?poll=1&since=all`)
+      .then(res => res.text())
+      .then(text => {
+        if (!text.trim()) return
+        const lines = text.split('\n').filter(Boolean)
+        for (const line of lines) {
+          try {
+            const rawMsg = JSON.parse(line)
+            if (rawMsg.event === 'message' && rawMsg.message) {
+              const parsed = JSON.parse(rawMsg.message)
+              if (parsed.type === 'select_game') {
+                const gameId = parsed.payload.gameId
+                const parts = players.map((n, i) => `p${i+1}=${encodeURIComponent(n)}`)
+                parts.push(`mode=online`)
+                parts.push(`room=${room}`)
+                parts.push(`role=${role}`)
+                router.push(`/${gameId}?${parts.join('&')}`)
+                return
+              }
+            }
+          } catch (e) {}
+        }
+      })
+      .catch(console.error)
+
+    const conn = new OnlineConnection(
+      room,
+      (event) => {
+        if (event.type === 'select_game') {
+          const gameId = event.payload.gameId
+          conn.disconnect()
+          const parts = players.map((n, i) => `p${i+1}=${encodeURIComponent(n)}`)
+          parts.push(`mode=online`)
+          parts.push(`room=${room}`)
+          parts.push(`role=${role}`)
+          router.push(`/${gameId}?${parts.join('&')}`)
+        }
+      },
+      (status) => setOnlineStatus(status),
+      processedIds
+    )
+
+    connectionRef.current = conn
+    conn.connect()
+
+    return () => {
+      conn.disconnect()
+    }
+  }, [isOnline, room, role])
+
   function pickGame(game: any) {
     if (!game.available) return
-    const q = players.map((n,i)=>`p${i+1}=${encodeURIComponent(n)}`).join('&')
-    router.push(`/${game.id}?${q}`)
+    
+    if (isOnline) {
+      if (role !== 'host') return // Guest cannot click
+      
+      publishEvent(room!, 'select_game', { gameId: game.id })
+      
+      setTimeout(() => {
+        if (connectionRef.current) connectionRef.current.disconnect()
+        const parts = players.map((n, i) => `p${i+1}=${encodeURIComponent(n)}`)
+        parts.push(`mode=online`)
+        parts.push(`room=${room}`)
+        parts.push(`role=host`)
+        router.push(`/${game.id}?${parts.join('&')}`)
+      }, 500)
+    } else {
+      const extraParams = ['mode', 'difficulty', 'first']
+      const parts = players.map((n, i) => `p${i+1}=${encodeURIComponent(n)}`)
+      extraParams.forEach(param => {
+        const val = searchParams.get(param)
+        if (val) parts.push(`${param}=${encodeURIComponent(val)}`)
+      })
+      const q = parts.join('&')
+      router.push(`/${game.id}?${q}`)
+    }
   }
 
   return (
@@ -71,6 +162,35 @@ function GamesContent() {
           <div style={{ height:1, background:'linear-gradient(to right, transparent, #00f0ff, transparent)', marginTop:10 }}/>
         </div>
 
+        {isOnline && (
+          <div style={{
+            background: '#111',
+            border: `1px solid ${role === 'host' ? '#00ff88' : '#ffaa00'}`,
+            borderRadius: 12,
+            padding: '12px',
+            marginBottom: 20,
+            textAlign: 'center',
+            boxShadow: `0 0 10px ${role === 'host' ? '#00ff8822' : '#ffaa0022'}`,
+          }}>
+            <p style={{
+              color: role === 'host' ? '#00ff88' : '#ffaa00',
+              fontSize: 10,
+              letterSpacing: 2,
+              textTransform: 'uppercase',
+              margin: 0,
+              fontWeight: 'bold',
+              lineHeight: 1.4
+            }}>
+              {role === 'host'
+                ? '🌐 YOU ARE THE HOST. SELECT A GAME TO START!'
+                : `🌐 WAITING FOR HOST TO SELECT GAME...`}
+            </p>
+            <p style={{ color: '#555', fontSize: 8, letterSpacing: 1, margin: '4px 0 0 0', textTransform: 'uppercase' }}>
+              ROOM CODE: {room} · STATUS: {onlineStatus.toUpperCase()}
+            </p>
+          </div>
+        )}
+
         {/* Compatible games */}
         {filteredGames.length>0 && (
           <p style={{ color:'#444', fontSize:10, letterSpacing:3, textTransform:'uppercase', marginBottom:10 }}>
@@ -86,7 +206,7 @@ function GamesContent() {
                 border:`1px solid ${game.available ? game.color+'66' : '#222'}`,
                 borderRadius:14, padding:'16px',
                 background: game.available ? `${game.color}08` : '#0d0d0d',
-                cursor: game.available ? 'pointer' : 'not-allowed',
+                cursor: game.available ? (isOnline && role !== 'host' ? 'default' : 'pointer') : 'not-allowed',
                 display:'flex', alignItems:'center', gap:14,
                 opacity: game.available ? 1 : 0.4,
                 WebkitTapHighlightColor:'transparent',

@@ -1,4 +1,4 @@
-const CACHE_NAME = 'pocket-arcade-cache-v1';
+const CACHE_NAME = 'pocket-arcade-cache-1782447069737';
 
 // Initial core assets to cache on service worker install
 const ASSETS_TO_CACHE = [
@@ -26,12 +26,11 @@ self.addEventListener('install', (event) => {
         console.log('[Service Worker] Precaching app shell');
         // Use map/all so if one request fails (e.g. during development), it doesn't break the installation of others
         return Promise.allSettled(
-          ASSETS_TO_CACHE.map(url => 
+          ASSETS_TO_CACHE.map(url =>
             cache.add(url).catch(err => console.warn(`[Service Worker] Failed to precache ${url}:`, err))
           )
         );
       })
-      .then(() => self.skipWaiting())
   );
 });
 
@@ -51,18 +50,24 @@ self.addEventListener('activate', (event) => {
   );
 });
 
-// Fetch event - handle requests with a Stale-While-Revalidate strategy for static/page assets
+// Fetch event - handle requests with a hybrid strategy:
+// Network-First for HTML, JS, JSON to prevent serving stale code/pages and avoid chunk loading errors.
+// Cache-First / Stale-While-Revalidate for other static assets (images, icons, favicon) to support offline.
 self.addEventListener('fetch', (event) => {
   // Only intercept GET requests
   if (event.request.method !== 'GET') return;
 
-  // Skip non-HTTP(S) schemes (like chrome-extension, data URIs, etc.)
+  // Skip non-HTTP(S) schemes
   if (!event.request.url.startsWith('http')) return;
 
-  event.respondWith(
-    caches.match(event.request).then((cachedResponse) => {
-      // Create a promise to fetch the latest resource from network in background
-      const fetchPromise = fetch(event.request)
+  const url = new URL(event.request.url);
+  const isHtml = event.request.headers.get('accept')?.includes('text/html');
+  const isJsOrJson = url.pathname.endsWith('.js') || url.pathname.endsWith('.json') || url.pathname.includes('_next/');
+
+  if (isHtml || isJsOrJson) {
+    // Network-First Strategy
+    event.respondWith(
+      fetch(event.request)
         .then((networkResponse) => {
           if (networkResponse && networkResponse.status === 200) {
             const responseToCache = networkResponse.clone();
@@ -72,22 +77,41 @@ self.addEventListener('fetch', (event) => {
           }
           return networkResponse;
         })
-        .catch((err) => {
-          console.warn('[Service Worker] Network fetch failed, using cache fallback if available:', err);
-        });
+        .catch(() => {
+          // Offline fallback
+          return caches.match(event.request).then((cachedResponse) => {
+            if (cachedResponse) return cachedResponse;
+            if (isHtml) return caches.match('/');
+          });
+        })
+    );
+  } else {
+    // Cache-First / Stale-While-Revalidate Strategy for static assets
+    event.respondWith(
+      caches.match(event.request).then((cachedResponse) => {
+        const fetchPromise = fetch(event.request)
+          .then((networkResponse) => {
+            if (networkResponse && networkResponse.status === 200) {
+              const responseToCache = networkResponse.clone();
+              caches.open(CACHE_NAME).then((cache) => {
+                cache.put(event.request, responseToCache);
+              });
+            }
+            return networkResponse;
+          })
+          .catch((err) => {
+            console.warn('[Service Worker] Static fetch failed:', err);
+          });
 
-      // If resource is in cache, return it immediately and let the network fetch update it in background
-      if (cachedResponse) {
-        return cachedResponse;
-      }
+        return cachedResponse || fetchPromise || fetch(event.request);
+      })
+    );
+  }
+});
 
-      // If resource is not in cache, wait for the network request to resolve
-      return fetchPromise || fetch(event.request);
-    }).catch(() => {
-      // Cache query failed or hit error, fallback to root or cache index if page request
-      if (event.request.headers.get('accept')?.includes('text/html')) {
-        return caches.match('/');
-      }
-    })
-  );
+// Message event - trigger skipWaiting when instructed by the client UI
+self.addEventListener('message', (event) => {
+  if (event.data && event.data.type === 'SKIP_WAITING') {
+    self.skipWaiting();
+  }
 });

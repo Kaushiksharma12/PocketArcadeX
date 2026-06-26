@@ -1,7 +1,7 @@
 <?xml version='1.0' encoding='utf-8'?>
 <resources>
-    <string name="app_name">Pocket Arcade</string>
-    <string name="title_activity_main">Pocket Arcade</string>
+    <string name="app_name">PocketArcadeX</string>
+    <string name="title_activity_main">PocketArcadeX</string>
     <string name="package_name">com.pocketarcade.app</string>
     <string name="custom_url_scheme">com.pocketarcade.app</string>
 </resources>

@@ -3,13 +3,16 @@ import './globals.css'
 import PWAInitializer from './pwa-initializer'
 
 export const metadata = {
-  title: 'Pocket Arcade',
+  title: 'PocketArcadeX',
   description: 'Retro game platform wrapped for mobile touch gameplay.',
   manifest: '/manifest.json',
   appleWebApp: {
     capable: true,
-    statusBarStyle: 'black-translucent' as const,
-    title: 'Pocket Arcade',
+    statusBarStyle: 'default',
+    title: 'PocketArcadeX',
+  },
+  icons: {
+    apple: '/icon-180.png',
   },
 }
 

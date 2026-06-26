@@ -1,6 +1,7 @@
 'use client'
-import { useState, useEffect, Suspense } from 'react'
+import { useState, useEffect, Suspense, useRef } from 'react'
 import { useSearchParams, useRouter } from 'next/navigation'
+import { publishEvent, fetchEventHistory, OnlineConnection, getSessionPlayerId } from '../lib/online'
 
 // Board grid: 15 rows x 15 columns
 const BOARD_SIZE = 15
@@ -156,6 +157,13 @@ function LudoContent() {
     return initialTokens
   })
 
+  const mode = searchParams.get('mode')?.trim() === 'bot'
+  const difficulty = searchParams.get('difficulty')?.trim() || 'medium'
+
+  const isOnline = searchParams.get('mode')?.trim() === 'online'
+  const room = searchParams.get('room')?.trim()?.toUpperCase()
+  const role = searchParams.get('role')?.trim()
+
   const [currentPlayerIdx, setCurrentPlayerIdx] = useState(0)
   const [diceVal, setDiceVal] = useState<number | null>(null)
   const [isRolling, setIsRolling] = useState(false)
@@ -165,12 +173,25 @@ function LudoContent() {
   const [winner, setWinner] = useState<string | null>(null)
   const [consecutiveSixes, setConsecutiveSixes] = useState(0)
   const [rankings, setRankings] = useState<string[]>([])
+  const [isBotThinking, setIsBotThinking] = useState(false)
+  const [isMoveInFlight, setIsMoveInFlight] = useState(false)
+
+  // Online status states
+  const [onlineStatus, setOnlineStatus] = useState<'connected' | 'connecting' | 'disconnected'>('disconnected')
+  const [isLoadingHistory, setIsLoadingHistory] = useState(isOnline)
+  const connectionRef = useRef<any>(null)
+  const processedIdsRef = useRef<Set<string>>(new Set())
+
+  const myRoleIdx = role === 'host' ? 0 : role ? parseInt(role.replace('guest', '')) : -1
+  const isMyTurn = !isOnline || (currentPlayerIdx === myRoleIdx)
 
   const currentPlayer = activePlayers[currentPlayerIdx]
 
   // Roll the dice
-  function rollDice() {
-    if (isRolling || hasRolled || winner) return
+  function rollDice(incomingRoll?: number, targetState?: any) {
+    if (isRolling || hasRolled || winner || isMoveInFlight) return
+
+    if (isOnline && incomingRoll === undefined && !isMyTurn) return
 
     setIsRolling(true)
     let rollInterval = setInterval(() => {
@@ -179,29 +200,192 @@ function LudoContent() {
 
     setTimeout(() => {
       clearInterval(rollInterval)
-      const finalVal = Math.floor(Math.random() * 6) + 1
+      const finalVal = incomingRoll !== undefined ? incomingRoll : (Math.floor(Math.random() * 6) + 1)
       setDiceVal(finalVal)
       setIsRolling(false)
-      setHasRolled(true)
 
-      if (finalVal === 6) {
-        const nextSixes = consecutiveSixes + 1
-        setConsecutiveSixes(nextSixes)
-        if (nextSixes === 3) {
-          setLog(`Three 6s in a row! 💥 Turn forfeited.`)
-          setConsecutiveSixes(0)
-          setTimeout(() => {
-            passTurn(true)
-          }, 1500)
-          return
+      if (isOnline) {
+        if (incomingRoll === undefined) {
+          // Compute the next state
+          const player = activePlayers[currentPlayerIdx]
+          
+          let nextConsecutiveSixes = consecutiveSixes
+          let nextPlayerIdx = currentPlayerIdx
+          let nextRankings = [...rankings]
+          let nextWinner = winner
+          let nextLog = ''
+          let nextMovableTokenIds: number[] = []
+          let nextHasRolled = true
+          
+          if (finalVal === 6) {
+            nextConsecutiveSixes += 1
+          } else {
+            nextConsecutiveSixes = 0
+          }
+          
+          if (finalVal === 6 && nextConsecutiveSixes === 3) {
+            nextLog = `Three 6s in a row! 💥 Turn forfeited.`
+            nextConsecutiveSixes = 0
+            nextHasRolled = false
+            // Pass turn
+            let nIdx = (currentPlayerIdx + 1) % playerCount
+            let attempts = 0
+            while (nextRankings.includes(activePlayers[nIdx].id) && attempts < playerCount) {
+              nIdx = (nIdx + 1) % playerCount
+              attempts++
+            }
+            nextPlayerIdx = nIdx
+            nextMovableTokenIds = []
+          } else {
+            // Evaluate moves
+            const playerTokens = tokens.filter(t => t.playerId === player.id)
+            playerTokens.forEach(token => {
+              if (token.posType === 'base') {
+                if (finalVal === 6) nextMovableTokenIds.push(token.tokenId)
+              } else if (token.posType === 'track') {
+                nextMovableTokenIds.push(token.tokenId)
+              } else if (token.posType === 'homeLane') {
+                const stepsNeeded = 57 - token.stepCount
+                if (finalVal <= stepsNeeded) nextMovableTokenIds.push(token.tokenId)
+              }
+            })
+            
+            if (nextMovableTokenIds.length === 0) {
+              nextLog = `${player.displayName} rolled a ${finalVal} but has no moves!`
+              nextHasRolled = false
+              // Pass turn
+              let nIdx = (currentPlayerIdx + 1) % playerCount
+              let attempts = 0
+              while (nextRankings.includes(activePlayers[nIdx].id) && attempts < playerCount) {
+                nIdx = (nIdx + 1) % playerCount
+                attempts++
+              }
+              nextPlayerIdx = nIdx
+            } else {
+              nextLog = `${player.displayName} rolled a ${finalVal}! Tap a highlighted token to move.`
+            }
+          }
+          
+          const nextState = {
+            tokens,
+            currentPlayerIdx: nextPlayerIdx,
+            diceVal: finalVal,
+            hasRolled: nextHasRolled,
+            movableTokenIds: nextMovableTokenIds,
+            log: nextLog,
+            winner: nextWinner,
+            consecutiveSixes: nextConsecutiveSixes,
+            rankings: nextRankings
+          }
+          
+          console.log('[LUDO] Outgoing state update (roll):', nextState)
+          setIsMoveInFlight(true)
+          publishEvent(room!, 'state_update', { state: nextState, roll: finalVal })
+            .catch(() => setIsMoveInFlight(false))
+        } else if (targetState) {
+          // Reconcile complete state
+          setTokens(targetState.tokens)
+          setCurrentPlayerIdx(targetState.currentPlayerIdx)
+          setDiceVal(targetState.diceVal)
+          setHasRolled(targetState.hasRolled)
+          setMovableTokenIds(targetState.movableTokenIds)
+          setLog(targetState.log)
+          setWinner(targetState.winner)
+          setConsecutiveSixes(targetState.consecutiveSixes)
+          setRankings(targetState.rankings)
         }
       } else {
-        setConsecutiveSixes(0)
+        // Offline gameplay
+        setHasRolled(true)
+        if (finalVal === 6) {
+          const nextSixes = consecutiveSixes + 1
+          setConsecutiveSixes(nextSixes)
+          if (nextSixes === 3) {
+            setLog(`Three 6s in a row! 💥 Turn forfeited.`)
+            setConsecutiveSixes(0)
+            setTimeout(() => {
+              passTurn(true)
+            }, 1500)
+            return
+          }
+        } else {
+          setConsecutiveSixes(0)
+        }
+        evaluateMoves(finalVal)
       }
-
-      evaluateMoves(finalVal)
     }, 800)
   }
+
+  // Ludo Bot automation trigger
+  useEffect(() => {
+    if (!mode || winner || isRolling) return
+
+    const isBotTurn = currentPlayer.displayName === 'Bot'
+    if (!isBotTurn) return
+
+    // 1. Bot rolls dice
+    if (!hasRolled && !isRolling) {
+      setIsBotThinking(true)
+      const timer = setTimeout(() => {
+        setIsBotThinking(false)
+        rollDice()
+      }, 700)
+      return () => clearTimeout(timer)
+    }
+
+    // 2. Bot selects token to move
+    if (hasRolled && movableTokenIds.length > 0) {
+      setIsBotThinking(true)
+      const timer = setTimeout(() => {
+        setIsBotThinking(false)
+        let selectedId = movableTokenIds[0]
+
+        if (difficulty === 'medium' || difficulty === 'hard') {
+          let bestPriority = -1
+          const playerTokens = tokens.filter(t => t.playerId === currentPlayer.id)
+
+          movableTokenIds.forEach(id => {
+            const token = playerTokens.find(t => t.tokenId === id)!
+            let priority = 0
+
+            if (token.posType === 'base' && diceVal === 6) {
+              priority = 3 // Exiting base is good
+            } else if (token.posType === 'track') {
+              let nextIdx = (token.trackIdx + (diceVal || 0)) % 52
+              const captures = tokens.some(ot => ot.playerId !== currentPlayer.id && ot.posType === 'track' && ot.trackIdx === nextIdx && !SAFE_TRACK_INDICES.includes(nextIdx))
+              if (captures) {
+                priority = 5 // Hitting opponent is best!
+              } else {
+                if (token.trackIdx === currentPlayer.homeExitIdx && (diceVal || 0) === 1) {
+                  priority = 4 // Home lane entry
+                } else {
+                  priority = 1
+                }
+              }
+            } else if (token.posType === 'homeLane') {
+              const stepsNeeded = 57 - token.stepCount
+              if (diceVal === stepsNeeded) {
+                priority = 4 // Goal entry is great!
+              } else {
+                priority = 2
+              }
+            }
+
+            if (priority > bestPriority) {
+              bestPriority = priority
+              selectedId = id
+            }
+          })
+        } else {
+          // Easy: random token
+          selectedId = movableTokenIds[Math.floor(Math.random() * movableTokenIds.length)]
+        }
+
+        executeTokenMove(selectedId)
+      }, 900)
+      return () => clearTimeout(timer)
+    }
+  }, [currentPlayerIdx, hasRolled, movableTokenIds, isRolling, winner, mode])
 
   // Find movable tokens for current player and rolled value
   function evaluateMoves(roll: number) {
@@ -240,161 +424,362 @@ function LudoContent() {
   }
 
   // Move token
-  function handleTokenClick(tokenId: number) {
-    if (!hasRolled || !movableTokenIds.includes(tokenId) || !diceVal || winner) return
+  function executeTokenMove(tokenId: number) {
+    if (isMoveInFlight || !hasRolled || !movableTokenIds.includes(tokenId) || !diceVal || winner) return
 
-    const roll = diceVal
-    let rolledSix = roll === 6
+    if (isOnline) {
+      // active client calculates next state
+      const roll = diceVal!
+        let rolledSix = roll === 6
 
-    const updatedTokens = tokens.map(token => {
-      if (token.playerId !== currentPlayer.id || token.tokenId !== tokenId) return token
+        const updatedTokens = tokens.map(token => {
+          if (token.playerId !== currentPlayer.id || token.tokenId !== tokenId) return token
 
-      let newPos = { ...token }
+          let newPos = { ...token }
 
-      if (token.posType === 'base') {
-        // Exit base
-        newPos.posType = 'track'
-        newPos.trackIdx = currentPlayer.startIdx
-        newPos.stepCount = 1
-      } else if (token.posType === 'track') {
-        // Normal track move
-        let stepsLeft = roll
-        let currentIdx = token.trackIdx
-        let stepsAccum = token.stepCount
+          if (token.posType === 'base') {
+            newPos.posType = 'track'
+            newPos.trackIdx = currentPlayer.startIdx
+            newPos.stepCount = 1
+          } else if (token.posType === 'track') {
+            let stepsLeft = roll
+            let currentIdx = token.trackIdx
+            let stepsAccum = token.stepCount
 
-        while (stepsLeft > 0) {
-          // If token is at its home exit square, enter home lane
-          if (currentIdx === currentPlayer.homeExitIdx) {
-            newPos.posType = 'homeLane'
-            newPos.homeLaneIdx = 0
-            newPos.stepCount = stepsAccum + 1
-            stepsLeft--
+            while (stepsLeft > 0) {
+              if (currentIdx === currentPlayer.homeExitIdx) {
+                newPos.posType = 'homeLane'
+                newPos.homeLaneIdx = 0
+                newPos.stepCount = stepsAccum + 1
+                stepsLeft--
 
-            // Continue moving inside home lane if steps remain
-            if (stepsLeft > 0) {
-              const targetLaneIdx = newPos.homeLaneIdx + stepsLeft
-              if (targetLaneIdx === 5) {
-                newPos.posType = 'done'
-                newPos.stepCount = 57
+                if (stepsLeft > 0) {
+                  const targetLaneIdx = newPos.homeLaneIdx + stepsLeft
+                  if (targetLaneIdx === 5) {
+                    newPos.posType = 'done'
+                    newPos.stepCount = 57
+                  } else {
+                    newPos.homeLaneIdx = targetLaneIdx
+                    newPos.stepCount += stepsLeft
+                  }
+                  stepsLeft = 0
+                }
+                break
               } else {
-                newPos.homeLaneIdx = targetLaneIdx
-                newPos.stepCount += stepsLeft
+                currentIdx = (currentIdx + 1) % 52
+                stepsAccum++
+                stepsLeft--
               }
-              stepsLeft = 0
             }
-            break
-          } else {
-            currentIdx = (currentIdx + 1) % 52
-            stepsAccum++
-            stepsLeft--
+
+            if (newPos.posType === 'track') {
+              newPos.trackIdx = currentIdx
+              newPos.stepCount = stepsAccum
+            }
+          } else if (token.posType === 'homeLane') {
+            const newLaneIdx = token.homeLaneIdx + roll
+            if (newLaneIdx === 5) {
+              newPos.posType = 'done'
+              newPos.stepCount = 57
+            } else {
+              newPos.homeLaneIdx = newLaneIdx
+              newPos.stepCount = token.stepCount + roll
+            }
           }
-        }
 
-        if (newPos.posType === 'track') {
-          newPos.trackIdx = currentIdx
-          newPos.stepCount = stepsAccum
-        }
-      } else if (token.posType === 'homeLane') {
-        // Move inside home lane
-        const newLaneIdx = token.homeLaneIdx + roll
-        if (newLaneIdx === 5) {
-          newPos.posType = 'done'
-          newPos.stepCount = 57
-        } else {
-          newPos.homeLaneIdx = newLaneIdx
-          newPos.stepCount = token.stepCount + roll
-        }
-      }
-
-      return newPos
-    })
-
-    // Collision Check: did we land on an opponent on a normal non-safe tile?
-    const movedToken = updatedTokens.find(t => t.playerId === currentPlayer.id && t.tokenId === tokenId)!
-    let capturedAny = false
-
-    if (movedToken.posType === 'track') {
-      const isSafeSpot = SAFE_TRACK_INDICES.includes(movedToken.trackIdx)
-      if (!isSafeSpot) {
-        // Look for opponent tokens on the same track index
-        updatedTokens.forEach(otherToken => {
-          if (otherToken.playerId !== currentPlayer.id && otherToken.posType === 'track' && otherToken.trackIdx === movedToken.trackIdx) {
-            // Send captured token back to base!
-            otherToken.posType = 'base'
-            otherToken.stepCount = 0
-            otherToken.trackIdx = 0
-            otherToken.homeLaneIdx = 0
-            capturedAny = true
-            setLog(`💥 ${currentPlayer.displayName} captured ${otherToken.playerId.toUpperCase()}'s token! Extra turn!`)
-          }
+          return newPos
         })
-      }
-    }
 
-    const originalToken = tokens.find(t => t.playerId === currentPlayer.id && t.tokenId === tokenId)!
-    const reachedHome = originalToken.posType !== 'done' && movedToken.posType === 'done'
+        // Collision Check
+        const movedToken = updatedTokens.find(t => t.playerId === currentPlayer.id && t.tokenId === tokenId)!
+        let capturedAny = false
+        let nextLog = ''
 
-    setTokens(updatedTokens)
-
-    // Check if this player has won/completed all tokens
-    const playerTokens = updatedTokens.filter(t => t.playerId === currentPlayer.id)
-    const allDone = playerTokens.every(t => t.posType === 'done')
-
-    let gameFinished = false
-    let updatedRankings = [...rankings]
-    if (allDone && !rankings.includes(currentPlayer.id)) {
-      updatedRankings.push(currentPlayer.id)
-      setRankings(updatedRankings)
-      setLog(`🎉 ${currentPlayer.displayName} finished all 4 tokens! (Rank #${updatedRankings.length})`)
-
-      // Game is completely over when all active players (or all except 1) have completed
-      const activePlayersRemaining = activePlayers.filter(p => !updatedRankings.includes(p.id))
-      if (activePlayersRemaining.length <= 1) {
-        if (activePlayersRemaining.length === 1) {
-          updatedRankings.push(activePlayersRemaining[0].id)
-          setRankings(updatedRankings)
+        if (movedToken.posType === 'track') {
+          const isSafeSpot = SAFE_TRACK_INDICES.includes(movedToken.trackIdx)
+          if (!isSafeSpot) {
+            updatedTokens.forEach(otherToken => {
+              if (otherToken.playerId !== currentPlayer.id && otherToken.posType === 'track' && otherToken.trackIdx === movedToken.trackIdx) {
+                otherToken.posType = 'base'
+                otherToken.stepCount = 0
+                otherToken.trackIdx = 0
+                otherToken.homeLaneIdx = 0
+                capturedAny = true
+                nextLog = `💥 ${currentPlayer.displayName} captured ${otherToken.playerId.toUpperCase()}'s token! Extra turn!`
+              }
+            })
+          }
         }
 
-        const rankingsStr = updatedRankings
-          .map((pId, idx) => {
-            const pName = activePlayers.find(ap => ap.id === pId)?.displayName || pId
-            return `#${idx + 1}: ${pName.toUpperCase()}`
-          })
-          .join(' · ')
+        const originalToken = tokens.find(t => t.playerId === currentPlayer.id && t.tokenId === tokenId)!
+        const reachedHome = originalToken.posType !== 'done' && movedToken.posType === 'done'
 
-        setWinner(activePlayers.find(p => p.id === updatedRankings[0])!.displayName)
-        setLog(`🏆 GAME COMPLETED! Rankings: ${rankingsStr}`)
-        gameFinished = true
-      }
-    }
+        const playerTokens = updatedTokens.filter(t => t.playerId === currentPlayer.id)
+        const allDone = playerTokens.every(t => t.posType === 'done')
 
-    if (gameFinished) return
+        let gameFinished = false
+        let updatedRankings = [...rankings]
+        let nextWinner = winner
+        if (allDone && !rankings.includes(currentPlayer.id)) {
+          updatedRankings.push(currentPlayer.id)
+          nextLog = `🎉 ${currentPlayer.displayName} finished all 4 tokens! (Rank #${updatedRankings.length})`
 
-    // If this player completed their tokens but the game isn't finished, force pass turn immediately
-    if (allDone) {
-      setTimeout(() => {
-        passTurnWithRankings(currentPlayerIdx, updatedRankings)
-      }, 1500)
-      return
-    }
+          const activePlayersRemaining = activePlayers.filter(p => !updatedRankings.includes(p.id))
+          if (activePlayersRemaining.length <= 1) {
+            if (activePlayersRemaining.length === 1) {
+              updatedRankings.push(activePlayersRemaining[0].id)
+            }
 
-    // Pass turn
-    // Rules: Get another roll if you roll a 6, capture an opponent, or bring a piece home
-    const getExtraRoll = rolledSix || capturedAny || reachedHome
-    if (getExtraRoll) {
-      setHasRolled(false)
-      setDiceVal(null)
-      setMovableTokenIds([])
-      if (reachedHome) {
-        setLog(`🎉 ${currentPlayer.displayName} brought a token home! Extra roll!`)
-      } else if (capturedAny) {
-        // Capture log is already set above
-      } else {
-        setLog(`${currentPlayer.displayName} rolled a 6! Extra roll!`)
-      }
+            const rankingsStr = updatedRankings
+              .map((pId, idx) => {
+                const pName = activePlayers.find(ap => ap.id === pId)?.displayName || pId
+                return `#${idx + 1}: ${pName.toUpperCase()}`
+              })
+              .join(' · ')
+
+            nextWinner = activePlayers.find(p => p.id === updatedRankings[0])!.displayName
+            nextLog = `🏆 GAME COMPLETED! Rankings: ${rankingsStr}`
+            gameFinished = true
+          }
+        }
+
+        let nextPlayerIdx = currentPlayerIdx
+        let nextHasRolled: boolean = hasRolled
+        let nextDiceVal: number | null = diceVal
+        let nextMovableTokenIds = [...movableTokenIds]
+        let nextConsecutiveSixes = consecutiveSixes
+
+        if (gameFinished) {
+          nextHasRolled = false
+          nextDiceVal = null
+          nextMovableTokenIds = []
+        } else if (allDone) {
+          // Pass turn
+          let nIdx = (currentPlayerIdx + 1) % playerCount
+          let attempts = 0
+          while (updatedRankings.includes(activePlayers[nIdx].id) && attempts < playerCount) {
+            nIdx = (nIdx + 1) % playerCount
+            attempts++
+          }
+          nextPlayerIdx = nIdx
+          nextHasRolled = false
+          nextDiceVal = null
+          nextMovableTokenIds = []
+          nextConsecutiveSixes = 0
+          nextLog = `It's now ${activePlayers[nIdx].displayName}'s turn.`
+        } else {
+          const getExtraRoll = rolledSix || capturedAny || reachedHome
+          if (getExtraRoll) {
+            nextHasRolled = false
+            nextDiceVal = null
+            nextMovableTokenIds = []
+            if (reachedHome) {
+              nextLog = `🎉 ${currentPlayer.displayName} brought a token home! Extra roll!`
+            } else if (capturedAny) {
+              // nextLog is already set to capture log
+            } else {
+              nextLog = `${currentPlayer.displayName} rolled a 6! Extra roll!`
+            }
+          } else {
+            // Pass turn
+            let nIdx = (currentPlayerIdx + 1) % playerCount
+            let attempts = 0
+            while (updatedRankings.includes(activePlayers[nIdx].id) && attempts < playerCount) {
+              nIdx = (nIdx + 1) % playerCount
+              attempts++
+            }
+            nextPlayerIdx = nIdx
+            nextHasRolled = false
+            nextDiceVal = null
+            nextMovableTokenIds = []
+            nextConsecutiveSixes = 0
+            nextLog = `It's now ${activePlayers[nIdx].displayName}'s turn.`
+          }
+        }
+
+        const nextState = {
+          tokens: updatedTokens,
+          currentPlayerIdx: nextPlayerIdx,
+          diceVal: nextDiceVal,
+          hasRolled: nextHasRolled,
+          movableTokenIds: nextMovableTokenIds,
+          log: nextLog,
+          winner: nextWinner,
+          consecutiveSixes: nextConsecutiveSixes,
+          rankings: updatedRankings
+        }
+
+        console.log('[LUDO] Outgoing state update (move):', nextState)
+        setIsMoveInFlight(true)
+        publishEvent(room!, 'state_update', { state: nextState })
+          .catch(() => setIsMoveInFlight(false))
     } else {
-      passTurnWithRankings(currentPlayerIdx, updatedRankings)
+
+      const roll = diceVal
+      let rolledSix = roll === 6
+
+      const updatedTokens = tokens.map(token => {
+        if (token.playerId !== currentPlayer.id || token.tokenId !== tokenId) return token
+
+        let newPos = { ...token }
+
+        if (token.posType === 'base') {
+          // Exit base
+          newPos.posType = 'track'
+          newPos.trackIdx = currentPlayer.startIdx
+          newPos.stepCount = 1
+        } else if (token.posType === 'track') {
+          // Normal track move
+          let stepsLeft = roll
+          let currentIdx = token.trackIdx
+          let stepsAccum = token.stepCount
+
+          while (stepsLeft > 0) {
+            // If token is at its home exit square, enter home lane
+            if (currentIdx === currentPlayer.homeExitIdx) {
+              newPos.posType = 'homeLane'
+              newPos.homeLaneIdx = 0
+              newPos.stepCount = stepsAccum + 1
+              stepsLeft--
+
+              // Continue moving inside home lane if steps remain
+              if (stepsLeft > 0) {
+                const targetLaneIdx = newPos.homeLaneIdx + stepsLeft
+                if (targetLaneIdx === 5) {
+                  newPos.posType = 'done'
+                  newPos.stepCount = 57
+                } else {
+                  newPos.homeLaneIdx = targetLaneIdx
+                  newPos.stepCount += stepsLeft
+                }
+                stepsLeft = 0
+              }
+              break
+            } else {
+              currentIdx = (currentIdx + 1) % 52
+              stepsAccum++
+              stepsLeft--
+            }
+          }
+
+          if (newPos.posType === 'track') {
+            newPos.trackIdx = currentIdx
+            newPos.stepCount = stepsAccum
+          }
+        } else if (token.posType === 'homeLane') {
+          // Move inside home lane
+          const newLaneIdx = token.homeLaneIdx + roll
+          if (newLaneIdx === 5) {
+            newPos.posType = 'done'
+            newPos.stepCount = 57
+          } else {
+            newPos.homeLaneIdx = newLaneIdx
+            newPos.stepCount = token.stepCount + roll
+          }
+        }
+
+        return newPos
+      })
+
+      // Collision Check: did we land on an opponent on a normal non-safe tile?
+      const movedToken = updatedTokens.find(t => t.playerId === currentPlayer.id && t.tokenId === tokenId)!
+      let capturedAny = false
+
+      if (movedToken.posType === 'track') {
+        const isSafeSpot = SAFE_TRACK_INDICES.includes(movedToken.trackIdx)
+        if (!isSafeSpot) {
+          // Look for opponent tokens on the same track index
+          updatedTokens.forEach(otherToken => {
+            if (otherToken.playerId !== currentPlayer.id && otherToken.posType === 'track' && otherToken.trackIdx === movedToken.trackIdx) {
+              // Send captured token back to base!
+              otherToken.posType = 'base'
+              otherToken.stepCount = 0
+              otherToken.trackIdx = 0
+              otherToken.homeLaneIdx = 0
+              capturedAny = true
+              setLog(`💥 ${currentPlayer.displayName} captured ${otherToken.playerId.toUpperCase()}'s token! Extra turn!`)
+            }
+          })
+        }
+      }
+
+      const originalToken = tokens.find(t => t.playerId === currentPlayer.id && t.tokenId === tokenId)!
+      const reachedHome = originalToken.posType !== 'done' && movedToken.posType === 'done'
+
+      setTokens(updatedTokens)
+
+      // Check if this player has won/completed all tokens
+      const playerTokens = updatedTokens.filter(t => t.playerId === currentPlayer.id)
+      const allDone = playerTokens.every(t => t.posType === 'done')
+
+      let gameFinished = false
+      let updatedRankings = [...rankings]
+      if (allDone && !rankings.includes(currentPlayer.id)) {
+        updatedRankings.push(currentPlayer.id)
+        setRankings(updatedRankings)
+        setLog(`🎉 ${currentPlayer.displayName} finished all 4 tokens! (Rank #${updatedRankings.length})`)
+
+        // Game is completely over when all active players (or all except 1) have completed
+        const activePlayersRemaining = activePlayers.filter(p => !updatedRankings.includes(p.id))
+        if (activePlayersRemaining.length <= 1) {
+          if (activePlayersRemaining.length === 1) {
+            updatedRankings.push(activePlayersRemaining[0].id)
+            setRankings(updatedRankings)
+          }
+
+          const rankingsStr = updatedRankings
+            .map((pId, idx) => {
+              const pName = activePlayers.find(ap => ap.id === pId)?.displayName || pId
+              return `#${idx + 1}: ${pName.toUpperCase()}`
+            })
+            .join(' · ')
+
+          setWinner(activePlayers.find(p => p.id === updatedRankings[0])!.displayName)
+          setLog(`🏆 GAME COMPLETED! Rankings: ${rankingsStr}`)
+          gameFinished = true
+        }
+      }
+
+      if (gameFinished) return
+
+      // If this player completed their tokens but the game isn't finished, force pass turn immediately
+      if (allDone) {
+        setTimeout(() => {
+          passTurnWithRankings(currentPlayerIdx, updatedRankings)
+        }, 1500)
+        return
+      }
+
+      // Pass turn
+      // Rules: Get another roll if you roll a 6, capture an opponent, or bring a piece home
+      const getExtraRoll = rolledSix || capturedAny || reachedHome
+      if (getExtraRoll) {
+        setHasRolled(false)
+        setDiceVal(null)
+        setMovableTokenIds([])
+        if (reachedHome) {
+          setLog(`🎉 ${currentPlayer.displayName} brought a token home! Extra roll!`)
+        } else if (capturedAny) {
+          // Capture log is already set above
+        } else {
+          setLog(`${currentPlayer.displayName} rolled a 6! Extra roll!`)
+        }
+      } else {
+        passTurnWithRankings(currentPlayerIdx, updatedRankings)
+      }
     }
+  }
+
+  function handleTokenClick(tokenId: number) {
+    if (mode && currentPlayer.displayName === 'Bot') return
+    if (isOnline && (!isMyTurn || isMoveInFlight)) return
+    executeTokenMove(tokenId)
+  }
+
+  function handleRollClick() {
+    if (mode && currentPlayer.displayName === 'Bot') return
+    if (isOnline && (!isMyTurn || isMoveInFlight)) return
+    rollDice()
   }
 
   // Move turn to next player, skipping players who have finished
@@ -422,30 +807,194 @@ function LudoContent() {
   }
 
   // Reset entire game board
-  function resetGame() {
-    const initialTokens: TokenState[] = []
-    activePlayers.forEach((player) => {
-      for (let i = 0; i < 4; i++) {
-        initialTokens.push({
-          playerId: player.id,
-          tokenId: i,
-          posType: 'base',
-          trackIdx: 0,
-          homeLaneIdx: 0,
-          stepCount: 0,
+  function resetGame(isIncoming = false) {
+    if (isOnline) {
+      if (!isIncoming) {
+        const initialTokens: TokenState[] = []
+        activePlayers.forEach((player) => {
+          for (let i = 0; i < 4; i++) {
+            initialTokens.push({
+              playerId: player.id,
+              tokenId: i,
+              posType: 'base',
+              trackIdx: 0,
+              homeLaneIdx: 0,
+              stepCount: 0,
+            })
+          }
         })
+        const resetState = {
+          tokens: initialTokens,
+          currentPlayerIdx: 0,
+          diceVal: null,
+          hasRolled: false,
+          movableTokenIds: [],
+          winner: null,
+          consecutiveSixes: 0,
+          rankings: [],
+          log: 'Game reset! Roll to start.'
+        }
+        console.log('[LUDO] Outgoing reset state:', resetState)
+        setIsMoveInFlight(true)
+        publishEvent(room!, 'state_update', { state: resetState })
+          .catch(() => setIsMoveInFlight(false))
       }
-    })
-    setTokens(initialTokens)
-    setCurrentPlayerIdx(0)
-    setDiceVal(null)
-    setHasRolled(false)
-    setMovableTokenIds([])
-    setWinner(null)
-    setConsecutiveSixes(0)
-    setRankings([])
-    setLog('Game reset! Roll to start.')
+    } else {
+      const initialTokens: TokenState[] = []
+      activePlayers.forEach((player) => {
+        for (let i = 0; i < 4; i++) {
+          initialTokens.push({
+            playerId: player.id,
+            tokenId: i,
+            posType: 'base',
+            trackIdx: 0,
+            homeLaneIdx: 0,
+            stepCount: 0,
+          })
+        }
+      })
+      setTokens(initialTokens)
+      setCurrentPlayerIdx(0)
+      setDiceVal(null)
+      setHasRolled(false)
+      setMovableTokenIds([])
+      setWinner(null)
+      setConsecutiveSixes(0)
+      setRankings([])
+      setLog('Game reset! Roll to start.')
+    }
   }
+
+  useEffect(() => {
+    if (!isOnline || !room) return
+
+    const processedIds = new Set<string>()
+    processedIdsRef.current = processedIds
+
+    async function initOnline() {
+      setIsLoadingHistory(true)
+      const history = await fetchEventHistory(room!)
+      console.log('[LUDO] Fetched history:', history)
+
+      const stateUpdateEvents = history.filter(e => e.type === 'state_update')
+      let initialRoomStateApplied = false
+
+      if (stateUpdateEvents.length > 0) {
+        const latestEvent = stateUpdateEvents[stateUpdateEvents.length - 1]
+        const state = latestEvent.payload.state
+        console.log('[LUDO] Reconstructed state from history:', state)
+
+        setTokens(state.tokens)
+        setCurrentPlayerIdx(state.currentPlayerIdx)
+        setDiceVal(state.diceVal)
+        setHasRolled(state.hasRolled)
+        setMovableTokenIds(state.movableTokenIds)
+        setLog(state.log)
+        setWinner(state.winner)
+        setConsecutiveSixes(state.consecutiveSixes)
+        setRankings(state.rankings)
+        initialRoomStateApplied = true
+      }
+
+      if (!initialRoomStateApplied && role === 'host') {
+        const initialTokens: TokenState[] = []
+        activePlayers.forEach((player) => {
+          for (let i = 0; i < 4; i++) {
+            initialTokens.push({
+              playerId: player.id,
+              tokenId: i,
+              posType: 'base',
+              trackIdx: 0,
+              homeLaneIdx: 0,
+              stepCount: 0,
+            })
+          }
+        })
+        const initialState = {
+          tokens: initialTokens,
+          currentPlayerIdx: 0,
+          diceVal: null,
+          hasRolled: false,
+          movableTokenIds: [],
+          winner: null,
+          consecutiveSixes: 0,
+          rankings: [],
+          log: 'Game reset! Roll to start.'
+        }
+        console.log('[LUDO] Host publishing initial room state:', initialState)
+        publishEvent(room!, 'state_update', { state: initialState })
+
+        setTokens(initialState.tokens)
+        setCurrentPlayerIdx(initialState.currentPlayerIdx)
+        setDiceVal(initialState.diceVal)
+        setHasRolled(initialState.hasRolled)
+        setMovableTokenIds(initialState.movableTokenIds)
+        setLog(initialState.log)
+        setWinner(initialState.winner)
+        setConsecutiveSixes(initialState.consecutiveSixes)
+        setRankings(initialState.rankings)
+      }
+
+      for (const event of history) {
+        processedIds.add(event.id)
+      }
+
+      setIsLoadingHistory(false)
+
+      const conn = new OnlineConnection(
+        room!,
+        (event) => {
+          console.log('[LUDO] Live event callback:', event)
+          if (event.type === 'state_update') {
+            const { state, roll } = event.payload
+            setIsMoveInFlight(false)
+            if (roll !== undefined) {
+              if (event.sender === getSessionPlayerId()) {
+                // We already rolled, just apply the rolled state immediately
+                setTokens(state.tokens)
+                setCurrentPlayerIdx(state.currentPlayerIdx)
+                setDiceVal(state.diceVal)
+                setHasRolled(state.hasRolled)
+                setMovableTokenIds(state.movableTokenIds)
+                setLog(state.log)
+                setWinner(state.winner)
+                setConsecutiveSixes(state.consecutiveSixes)
+                setRankings(state.rankings)
+              } else {
+                console.log('[LUDO] Roll received, playing animation:', roll, state)
+                rollDice(roll, state)
+              }
+            } else {
+              console.log('[LUDO] State update received, applying:', state)
+              setTokens(state.tokens)
+              setCurrentPlayerIdx(state.currentPlayerIdx)
+              setDiceVal(state.diceVal)
+              setHasRolled(state.hasRolled)
+              setMovableTokenIds(state.movableTokenIds)
+              setLog(state.log)
+              setWinner(state.winner)
+              setConsecutiveSixes(state.consecutiveSixes)
+              setRankings(state.rankings)
+            }
+          }
+        },
+        (status) => setOnlineStatus(status),
+        processedIds,
+        true // includeSelf = true
+      )
+
+      connectionRef.current = conn
+      conn.connect()
+    }
+
+    initOnline()
+
+    return () => {
+      if (connectionRef.current) {
+        connectionRef.current.disconnect()
+      }
+    }
+  }, [isOnline, room])
 
   // Render tokens at specific coordinates on the board grid
   function getTokensAt(row: number, col: number) {
@@ -629,32 +1178,32 @@ function LudoContent() {
         }}>
           {isTurn ? (
             <button
-              onClick={rollDice}
-              disabled={isRolling || hasRolled}
+              onClick={handleRollClick}
+              disabled={isRolling || hasRolled || (mode && activePlayer.displayName === 'Bot') || (isOnline && !isMyTurn)}
               className="btn-touch"
               style={{
                 width: '100%',
                 height: '100%',
-                background: isPlayerTurnToRoll ? `linear-gradient(135deg, ${config.color}, ${config.color}cc)` : '#ffffff',
+                background: isPlayerTurnToRoll && !(mode && activePlayer.displayName === 'Bot') && (!isOnline || isMyTurn) ? `linear-gradient(135deg, ${config.color}, ${config.color}cc)` : '#ffffff',
                 border: 'none',
                 borderRadius: 7,
-                color: isPlayerTurnToRoll ? '#ffffff' : config.color,
-                fontSize: diceVal ? 28 : 20,
+                color: isPlayerTurnToRoll && !(mode && activePlayer.displayName === 'Bot') && (!isOnline || isMyTurn) ? '#ffffff' : config.color,
+                fontSize: (isBotThinking || isPlayerRolling) ? 20 : (diceVal ? 28 : 20),
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'center',
-                cursor: isRolling || hasRolled ? 'default' : 'pointer',
-                boxShadow: isPlayerTurnToRoll ? `0 0 10px ${config.color}88` : 'none',
+                cursor: isRolling || hasRolled || (mode && activePlayer.displayName === 'Bot') || (isOnline && !isMyTurn) ? 'default' : 'pointer',
+                boxShadow: isPlayerTurnToRoll && !(mode && activePlayer.displayName === 'Bot') && (!isOnline || isMyTurn) ? `0 0 10px ${config.color}88` : 'none',
                 transform: isPlayerRolling ? 'rotate(360deg)' : 'none',
                 transition: isPlayerRolling ? 'transform 0.8s cubic-bezier(0.175, 0.885, 0.32, 1.275)' : 'none',
-                textShadow: isPlayerTurnToRoll ? '0 1px 2px rgba(0,0,0,0.3)' : `0 0 4px ${config.color}33`,
+                textShadow: isPlayerTurnToRoll && !(mode && activePlayer.displayName === 'Bot') && (!isOnline || isMyTurn) ? '0 1px 2px rgba(0,0,0,0.3)' : `0 0 4px ${config.color}33`,
                 padding: 0,
                 outline: 'none',
                 WebkitTapHighlightColor: 'transparent',
-                animation: isPlayerTurnToRoll ? 'pulse-dice 1.2s infinite alternate' : 'none',
+                animation: isPlayerTurnToRoll && !(mode && activePlayer.displayName === 'Bot') && (!isOnline || isMyTurn) ? 'pulse-dice 1.2s infinite alternate' : 'none',
               }}
             >
-              {isPlayerRolling ? '🎲' : (diceVal ? DICE_FACES[diceVal - 1] : '🎲')}
+              {isBotThinking ? '🤖' : (isPlayerRolling ? '🎲' : (diceVal ? DICE_FACES[diceVal - 1] : '🎲'))}
             </button>
           ) : (
             <span style={{ fontSize: 16, color: '#374151', opacity: 0.5 }}>
@@ -698,6 +1247,28 @@ function LudoContent() {
           ● {currentPlayer.displayName}'s turn ({currentPlayer.name})
         </div>
       </div>
+
+      {/* Online Status Header */}
+      {isOnline && (
+        <div style={{
+          background: '#11112b', border: `1px solid ${onlineStatus === 'connected' ? '#00ff88' : '#ef4444'}`,
+          borderRadius: 14, padding: '8px 16px', marginBottom: 12, display: 'flex', alignItems: 'center', gap: 8,
+          boxShadow: `0 0 10px ${onlineStatus === 'connected' ? '#00ff8822' : '#ef444422'}`,
+          width: '100%', maxWidth: 370, boxSizing: 'border-box'
+        }}>
+          <span style={{
+            width: 8, height: 8, borderRadius: '50%',
+            background: onlineStatus === 'connected' ? '#00ff88' : '#ef4444',
+            boxShadow: `0 0 8px ${onlineStatus === 'connected' ? '#00ff88' : '#ef4444'}`
+          }} />
+          <span style={{ color: '#fff', fontSize: 10, letterSpacing: 1, textTransform: 'uppercase', fontWeight: 'bold' }}>
+            {onlineStatus === 'connected' ? `ONLINE (ROOM: ${room})` : 'RECONNECTING...'}
+          </span>
+          <span style={{ color: '#666', fontSize: 10, marginLeft: 'auto', textTransform: 'uppercase', fontWeight: 'bold' }}>
+            ROLE: {role === 'host' ? 'HOST' : 'GUEST'} {activePlayers[myRoleIdx] ? `(${activePlayers[myRoleIdx].displayName.toUpperCase()})` : ''}
+          </span>
+        </div>
+      )}
 
       {/* Status Log */}
       <div style={{
@@ -995,7 +1566,7 @@ function LudoContent() {
 
       {/* Action Buttons */}
       <div style={{ display: 'flex', gap: 10, width: '100%', maxWidth: 370, marginTop: 18 }}>
-        <button onClick={resetGame} className="btn-touch" style={{
+        <button onClick={() => resetGame(false)} className="btn-touch" style={{
           flex: 1, padding: '12px',
           background: 'transparent',
           border: '2px solid #ef4444',
@@ -1071,7 +1642,7 @@ function LudoContent() {
             )}
 
             <div style={{ display: 'flex', gap: 10 }}>
-              <button onClick={resetGame} className="btn-touch" style={{
+              <button onClick={() => resetGame(false)} className="btn-touch" style={{
                 flex: 1, padding: '14px 12px',
                 background: 'transparent',
                 border: '2px solid #00ff88',
@@ -1132,7 +1703,32 @@ function LudoContent() {
           transform: scale(0.94) !important;
           filter: brightness(0.9) !important;
         }
+        @keyframes pulse {
+          0%, 100% { opacity: 0.3; }
+          50% { opacity: 1; }
+        }
+        .dot-pulse {
+          width: 24px;
+          height: 24px;
+          border-radius: 50%;
+          background: #00ff88;
+          display: inline-block;
+          animation: pulse 1.5s infinite ease-in-out;
+          box-shadow: 0 0 16px #00ff88;
+        }
       `}</style>
+
+      {isLoadingHistory && (
+        <div style={{
+          position: 'fixed', inset: 0, background: 'rgba(10, 10, 26, 0.95)',
+          display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', zIndex: 1000
+        }}>
+          <div style={{ fontSize: 40, marginBottom: 12 }} className="dot-pulse" />
+          <p style={{ color: '#fff', fontSize: 12, letterSpacing: 2, fontWeight: 'bold', textTransform: 'uppercase' }}>
+            SYNCHRONIZING BOARD STATE...
+          </p>
+        </div>
+      )}
     </main>
   )
 }
