@@ -1,0 +1,41 @@
+﻿
+C:\Users\kaush\PocketArcadeX\app\chess\page.tsx
+  160:11  warning  Unused eslint-disable directive (no problems were reported from '@typescript-eslint/no-use-before-define')
+  161:11  error    Error: Cannot access variable before it is declared
+
+`makeMove` is accessed before it is declared, which prevents the earlier access from updating when this value changes over time.
+
+C:\Users\kaush\PocketArcadeX\app\chess\page.tsx:161:11
+  159 |         if (move) {
+  160 |           // eslint-disable-next-line @typescript-eslint/no-use-before-define
+> 161 |           makeMove(move.from, move.to, move.promotion || 'q')
+      |           ^^^^^^^^ `makeMove` accessed before it is declared
+  162 |         }
+  163 |         setIsBotThinking(false)
+  164 |       }, delay)
+
+C:\Users\kaush\PocketArcadeX\app\chess\page.tsx:243:3
+  241 |
+  242 |   // Execute chess move
+> 243 |   function makeMove(from: Square, to: Square, promotionPiece = 'q') {
+      |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+> 244 |     if (isOnline) {
+      | ^^^^^^^^^^^^^^^^^^^
+> 245 |       try {
+      ΓÇª
+      | ^^^^^^^^^^^^^^^^^^^
+> 293 |     }
+      | ^^^^^^^^^^^^^^^^^^^
+> 294 |   }
+      | ^^^^ `makeMove` is declared here
+  295 |
+  296 |   // Resignation action
+  297 |   function handleResign() {  react-hooks/immutability
+  179:62  error    Unexpected any. Specify a different type                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            @typescript-eslint/no-explicit-any
+
+C:\Users\kaush\PocketArcadeX\app\games\page.tsx
+  67:20  warning  'e' is defined but never used  @typescript-eslint/no-unused-vars
+
+Γ£û 4 problems (2 errors, 2 warnings)
+  0 errors and 1 warning potentially fixable with the `--fix` option.
+

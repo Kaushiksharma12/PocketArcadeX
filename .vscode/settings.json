@@ -1,1 +1,5 @@
-{"java.import.gradle.nestedProjects": true, "gradle.nestedProjects": true}
+{
+    "java.import.gradle.nestedProjects": true,
+    "gradle.nestedProjects": true,
+    "java.configuration.updateBuildConfiguration": "interactive"
+}

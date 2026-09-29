@@ -22,7 +22,7 @@ export default function PWAInitializer() {
 
     const isStandalone = () => {
       return (
-        (window.navigator as any).standalone === true ||
+        (window.navigator as unknown as { standalone: boolean }).standalone === true ||
         window.matchMedia('(display-mode: standalone)').matches
       )
     }
@@ -40,7 +40,7 @@ export default function PWAInitializer() {
     if (!('serviceWorker' in navigator)) return
 
     let registration: ServiceWorkerRegistration | null = null
-    let updateInterval: any = null
+    let updateInterval: ReturnType<typeof setInterval> | null = null
 
     const handleRegister = async () => {
       try {

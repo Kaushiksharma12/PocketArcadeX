@@ -1,491 +1,283 @@
 'use client'
-import { useState, useEffect, useRef, Suspense } from 'react'
-import { useSearchParams, useRouter } from 'next/navigation'
+import { useState, useEffect, useCallback } from 'react'
+import { useRouter } from 'next/navigation'
+import { useTheme } from '@/components/ThemeProvider'
+import BottomNav from '@/components/BottomNav'
 
-const GRID_SIZE = 16 // 16x16 grid
+const GRID_SIZE = 16
 
-function SnakeContent() {
-  const searchParams = useSearchParams()
+type Direction = 'UP' | 'DOWN' | 'LEFT' | 'RIGHT'
+type Position = { x: number; y: number }
+
+export default function Snake() {
   const router = useRouter()
+  const { effectiveTheme } = useTheme()
+  const isDark = effectiveTheme === 'dark'
 
-  const p1 = decodeURIComponent(searchParams.get('p1') || 'Player')
-
-  // Game States: 'intro' | 'playing' | 'gameover'
-  const [gameState, setGameState] = useState<'intro' | 'playing' | 'gameover'>('intro')
-  const [snake, setSnake] = useState<{ r: number; c: number }[]>([])
-  const [direction, setDirection] = useState<{ dr: number; dc: number }>({ dr: 0, dc: -1 })
-  const [food, setFood] = useState<{ r: number; c: number }>({ r: 5, c: 5 })
+  const [snake, setSnake] = useState<Position[]>([
+    { x: 8, y: 8 },
+    { x: 8, y: 9 },
+  ])
+  const [food, setFood] = useState<Position>({ x: 4, y: 4 })
+  const [dir, setDir] = useState<Direction>('UP')
+  const [nextDir, setNextDir] = useState<Direction>('UP')
   const [score, setScore] = useState(0)
   const [highScore, setHighScore] = useState(0)
-  const [newHighScoreAchieved, setNewHighScoreAchieved] = useState(false)
+  const [gameOver, setGameOver] = useState(false)
+  const [isPaused, setIsPaused] = useState(false)
 
-  const gameIntervalRef = useRef<NodeJS.Timeout | null>(null)
-  const directionRef = useRef(direction)
-
-  // Load high score on mount
   useEffect(() => {
-    const savedHighScore = localStorage.getItem('arcade_snake_highscore')
-    if (savedHighScore) {
-      setHighScore(parseInt(savedHighScore, 10))
+    const saved = localStorage.getItem('pa_snake_high')
+    if (saved) setHighScore(parseInt(saved, 10))
+  }, [])
+
+  const generateFood = useCallback((currentSnake: Position[]) => {
+    while (true) {
+      const rx = Math.floor(Math.random() * GRID_SIZE)
+      const ry = Math.floor(Math.random() * GRID_SIZE)
+      if (!currentSnake.some(p => p.x === rx && p.y === ry)) {
+        return { x: rx, y: ry }
+      }
     }
   }, [])
 
-  // Initialize game
-  function initGame() {
-    // Start snake in center
-    const initialSnake = [
-      { r: Math.floor(GRID_SIZE / 2), c: Math.floor(GRID_SIZE / 2) },
-      { r: Math.floor(GRID_SIZE / 2), c: Math.floor(GRID_SIZE / 2) + 1 },
-      { r: Math.floor(GRID_SIZE / 2), c: Math.floor(GRID_SIZE / 2) + 2 },
-    ]
-    setSnake(initialSnake)
-    const initialDirection = { dr: 0, dc: -1 }
-    setDirection(initialDirection)
-    directionRef.current = initialDirection
-    setScore(0)
-    setNewHighScoreAchieved(false)
-    spawnFood(initialSnake)
-  }
-
-  // Spawn food not on the snake body
-  function spawnFood(currentSnake: { r: number; c: number }[]) {
-    let newFood = { r: 0, c: 0 }
-    let onSnake = true
-    let attempts = 0
-    while (onSnake && attempts < 1000) {
-      newFood = {
-        r: Math.floor(Math.random() * GRID_SIZE),
-        c: Math.floor(Math.random() * GRID_SIZE),
-      }
-      onSnake = currentSnake.some(cell => cell.r === newFood.r && cell.c === newFood.c)
-      attempts++
+  const handleKeyPress = useCallback((e: KeyboardEvent) => {
+    if (gameOver) return
+    switch (e.key) {
+      case 'ArrowUp':
+      case 'w':
+        if (dir !== 'DOWN') setNextDir('UP')
+        break
+      case 'ArrowDown':
+      case 's':
+        if (dir !== 'UP') setNextDir('DOWN')
+        break
+      case 'ArrowLeft':
+      case 'a':
+        if (dir !== 'RIGHT') setNextDir('LEFT')
+        break
+      case 'ArrowRight':
+      case 'd':
+        if (dir !== 'LEFT') setNextDir('RIGHT')
+        break
     }
-    setFood(newFood)
-  }
+  }, [dir, gameOver])
 
-  // Start round gameplay
-  function startPlaying() {
-    initGame()
-    setGameState('playing')
-  }
-
-  // Handle direction change safely
-  function changeDirection(dr: number, dc: number) {
-    const cur = directionRef.current
-    // Prevent 180-degree turns
-    if (cur.dr !== 0 && dr !== 0) return
-    if (cur.dc !== 0 && dc !== 0) return
-
-    const newDir = { dr, dc }
-    setDirection(newDir)
-    directionRef.current = newDir
-  }
-
-  // Listen to keyboard arrow keys
   useEffect(() => {
-    function handleKeyDown(e: KeyboardEvent) {
-      if (gameState !== 'playing') return
-      if (e.key === 'ArrowUp' || e.key === 'w' || e.key === 'W') {
-        e.preventDefault()
-        changeDirection(-1, 0)
-      }
-      if (e.key === 'ArrowDown' || e.key === 's' || e.key === 'S') {
-        e.preventDefault()
-        changeDirection(1, 0)
-      }
-      if (e.key === 'ArrowLeft' || e.key === 'a' || e.key === 'A') {
-        e.preventDefault()
-        changeDirection(0, -1)
-      }
-      if (e.key === 'ArrowRight' || e.key === 'd' || e.key === 'D') {
-        e.preventDefault()
-        changeDirection(0, 1)
-      }
-    }
-    window.addEventListener('keydown', handleKeyDown)
-    return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [gameState])
+    window.addEventListener('keydown', handleKeyPress)
+    return () => window.removeEventListener('keydown', handleKeyPress)
+  }, [handleKeyPress])
 
-  // Core game tick loop
   useEffect(() => {
-    if (gameState !== 'playing') {
-      if (gameIntervalRef.current) clearInterval(gameIntervalRef.current)
-      return
-    }
+    if (gameOver || isPaused) return
 
-    gameIntervalRef.current = setInterval(() => {
+    const interval = setInterval(() => {
+      setDir(nextDir)
       setSnake(prevSnake => {
-        if (prevSnake.length === 0) return prevSnake
-        const head = prevSnake[0]
-        const dir = directionRef.current
-        const newHead = { r: head.r + dir.dr, c: head.c + dir.dc }
+        const head = { ...prevSnake[0] }
+        switch (nextDir) {
+          case 'UP': head.y -= 1; break
+          case 'DOWN': head.y += 1; break
+          case 'LEFT': head.x -= 1; break
+          case 'RIGHT': head.x += 1; break
+        }
 
-        // Wall Collision
-        if (newHead.r < 0 || newHead.r >= GRID_SIZE || newHead.c < 0 || newHead.c >= GRID_SIZE) {
-          handleCrash()
+        if (head.x < 0 || head.x >= GRID_SIZE || head.y < 0 || head.y >= GRID_SIZE) {
+          setGameOver(true)
           return prevSnake
         }
 
-        // Body Collision (excluding tail if it moves out)
-        const selfCollision = prevSnake.slice(0, -1).some(cell => cell.r === newHead.r && cell.c === newHead.c)
-        if (selfCollision) {
-          handleCrash()
+        if (prevSnake.some(p => p.x === head.x && p.y === head.y)) {
+          setGameOver(true)
           return prevSnake
         }
 
-        const newSnake = [newHead, ...prevSnake]
-
-        // Food eating
-        if (newHead.r === food.r && newHead.c === food.c) {
+        const newSnake = [head, ...prevSnake]
+        if (head.x === food.x && head.y === food.y) {
           setScore(s => {
-            const nextScore = s + 1
-            // Check high score progress in real-time
+            const nextScore = s + 10
             if (nextScore > highScore) {
-              setNewHighScoreAchieved(true)
+              setHighScore(nextScore)
+              localStorage.setItem('pa_snake_high', String(nextScore))
             }
             return nextScore
           })
-          spawnFood(newSnake)
+          setFood(generateFood(newSnake))
         } else {
-          newSnake.pop() // remove tail
+          newSnake.pop()
         }
 
         return newSnake
       })
     }, 150)
 
-    return () => {
-      if (gameIntervalRef.current) clearInterval(gameIntervalRef.current)
-    }
-  }, [gameState, food, highScore])
+    return () => clearInterval(interval)
+  }, [nextDir, food, gameOver, isPaused, highScore, generateFood])
 
-  // Handle crash
-  function handleCrash() {
-    if (gameIntervalRef.current) clearInterval(gameIntervalRef.current)
-
-    setGameState('gameover')
-    setScore(currentScore => {
-      const savedHighScore = localStorage.getItem('arcade_snake_highscore')
-      const currentHighScore = savedHighScore ? parseInt(savedHighScore, 10) : 0
-      if (currentScore > currentHighScore) {
-        localStorage.setItem('arcade_snake_highscore', currentScore.toString())
-        setHighScore(currentScore)
-        setNewHighScoreAchieved(true)
-      }
-      return currentScore
-    })
+  function resetGame() {
+    const initSnake = [{ x: 8, y: 8 }, { x: 8, y: 9 }]
+    setSnake(initSnake)
+    setDir('UP')
+    setNextDir('UP')
+    setFood(generateFood(initSnake))
+    setScore(0)
+    setGameOver(false)
+    setIsPaused(false)
   }
 
-  // Rematch entire game
-  function resetAll() {
-    setGameState('intro')
+  function handlePadClick(newDir: Direction) {
+    if (gameOver) return
+    if (newDir === 'UP' && dir !== 'DOWN') setNextDir('UP')
+    if (newDir === 'DOWN' && dir !== 'UP') setNextDir('DOWN')
+    if (newDir === 'LEFT' && dir !== 'RIGHT') setNextDir('LEFT')
+    if (newDir === 'RIGHT' && dir !== 'LEFT') setNextDir('RIGHT')
   }
 
   return (
     <main style={{
       minHeight: '100dvh',
-      background: '#0a0a1a',
-      fontFamily: "'Courier New', monospace",
-      display: 'flex',
-      flexDirection: 'column',
-      alignItems: 'center',
-      justifyContent: 'center',
-      padding: '20px 16px',
+      maxWidth: 500,
+      margin: '0 auto',
+      background: isDark ? '#0b0b0e' : '#f8f9fa',
+      color: isDark ? '#f9fafb' : '#111827',
+      padding: '16px 16px 84px 16px',
       boxSizing: 'border-box',
-      overflowX: 'hidden',
-      userSelect: 'none',
-      WebkitUserSelect: 'none',
-      WebkitTouchCallout: 'none',
-      touchAction: 'manipulation',
+      position: 'relative',
+      fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif",
+      transition: 'background-color 0.3s ease, color 0.3s ease',
     }}>
 
-      {/* Title */}
-      <h1 style={{
-        fontSize: 20, fontWeight: 900, color: '#fff',
-        letterSpacing: 6, textTransform: 'uppercase',
-        textShadow: '0 0 20px #ffaa00',
-        marginBottom: 16, marginTop: 0,
-      }}>ARCADE SNAKE</h1>
+      {/* Header */}
+      <header style={{
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        marginBottom: 16, paddingTop: 'env(safe-area-inset-top, 0px)',
+      }}>
+        <button
+          onClick={() => router.back()}
+          className="btn-touch"
+          style={{
+            width: 38, height: 38, borderRadius: '50%',
+            background: isDark ? '#17171c' : '#ffffff',
+            border: `1px solid ${isDark ? '#272730' : '#e5e7eb'}`,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            color: isDark ? '#f9fafb' : '#111827', cursor: 'pointer',
+          }}
+        >
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
+        </button>
 
-      {/* Screen 1: Intro / ready */}
-      {gameState === 'intro' && (
-        <div style={{
-          background: '#0d0d20',
-          border: '2px solid #ffaa00',
-          borderRadius: 20,
-          padding: '30px 20px',
-          width: '100%',
-          maxWidth: 340,
-          textAlign: 'center',
-          boxShadow: '0 0 20px rgba(255, 170, 0, 0.2)',
-          boxSizing: 'border-box',
+        <h1 style={{ fontSize: 20, fontWeight: 800, margin: 0 }}>Snake</h1>
+
+        <button onClick={resetGame} className="btn-touch" style={{
+          padding: '6px 12px', borderRadius: 9999,
+          background: isDark ? '#17171c' : '#ffffff', border: `1px solid ${isDark ? '#272730' : '#e5e7eb'}`,
+          fontSize: 12, fontWeight: 700, color: isDark ? '#9ca3af' : '#6b7280', cursor: 'pointer',
         }}>
-          <div style={{ fontSize: 48, marginBottom: 16 }}>🐍</div>
-          <h2 style={{ color: '#ffaa00', fontSize: 16, letterSpacing: 2, textTransform: 'uppercase', margin: '0 0 10px 0' }}>
-            READY PLAYER 1
-          </h2>
-          <h3 style={{ color: '#fff', fontSize: 24, fontWeight: 'bold', margin: '0 0 20px 0' }}>
-            {p1.toUpperCase()}
-          </h3>
-          <div style={{
-            display: 'flex', justifyContent: 'center', gap: 20, marginBottom: 24
-          }}>
-            <div style={{ textAlign: 'center' }}>
-              <div style={{ fontSize: 9, color: '#555', letterSpacing: 1 }}>HIGH SCORE</div>
-              <div style={{ fontSize: 22, fontWeight: 'bold', color: '#ffaa00' }}>{highScore}</div>
-            </div>
-          </div>
-          <p style={{ color: '#666', fontSize: 11, lineHeight: '1.6', margin: '0 0 24px 0' }}>
-            Eat the yellow apples. Avoid the walls and your own tail. Use arrow/WASD keys or the D-pad below to steer.
-          </p>
-          <button onClick={startPlaying} className="btn-touch" style={{
-            width: '100%', padding: '16px',
-            background: 'linear-gradient(135deg, #ffaa00, #d97706)',
-            border: 'none', borderRadius: 12,
-            color: '#fff', fontSize: 14, fontWeight: 'bold',
-            letterSpacing: 2, cursor: 'pointer',
-            outline: 'none',
-            WebkitTapHighlightColor: 'transparent',
-            boxShadow: '0 4px 15px rgba(255, 170, 0, 0.3)'
-          }}>
-            START PLAYING →
-          </button>
-        </div>
-      )}
+          Reset
+        </button>
+      </header>
 
-      {/* Screen 2: Playing State */}
-      {gameState === 'playing' && (
-        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', width: '100%', maxWidth: 340 }}>
-          {/* HUD info */}
-          <div style={{
-            display: 'flex', justifyContent: 'space-between',
-            width: '100%', color: '#fff', fontSize: 11,
-            marginBottom: 10, letterSpacing: 1
-          }}>
-            <span style={{ color: '#ffaa00' }}>{p1.toUpperCase()}</span>
-            <span>SCORE: <b style={{ fontSize: 13, color: '#00ff88' }}>{score}</b></span>
-            <span>BEST: <b style={{ fontSize: 13, color: '#ffaa00' }}>{Math.max(highScore, score)}</b></span>
-          </div>
+      {/* Score Box */}
+      <div style={{
+        display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+        background: isDark ? '#17171c' : '#ffffff', borderRadius: 16,
+        border: `1px solid ${isDark ? '#272730' : '#e5e7eb'}`, padding: '10px 16px',
+        marginBottom: 14,
+      }}>
+        <span style={{ fontSize: 13, fontWeight: 700 }}>Score: <b style={{ color: isDark ? '#ff453a' : '#ff3b30' }}>{score}</b></span>
+        <span style={{ fontSize: 13, fontWeight: 700 }}>Best: <b style={{ color: '#10b981' }}>{highScore}</b></span>
+      </div>
 
-          {/* Grid board */}
-          <div style={{
-            background: '#04040e',
-            border: '3px solid #ffaa00',
-            borderRadius: 12,
-            width: '100%',
-            aspectRatio: '1',
-            boxSizing: 'border-box',
-            position: 'relative',
-            display: 'grid',
-            gridTemplateColumns: `repeat(${GRID_SIZE}, 1fr)`,
-            gridTemplateRows: `repeat(${GRID_SIZE}, 1fr)`,
-            padding: 4,
-            gap: 1,
-            boxShadow: '0 0 20px rgba(255, 170, 0, 0.15)',
-            marginBottom: 20
-          }}>
-            {Array.from({ length: GRID_SIZE }).map((_, r) => (
-              Array.from({ length: GRID_SIZE }).map((_, c) => {
-                const isHead = snake[0]?.r === r && snake[0]?.c === c
-                const isBody = snake.slice(1).some(cell => cell.r === r && cell.c === c)
-                const isFood = food.r === r && food.c === c
+      {/* Snake Grid */}
+      <div style={{
+        width: '100%', aspectRatio: '1', background: isDark ? '#121217' : '#15803d15',
+        borderRadius: 24, border: `2px solid ${isDark ? '#272730' : '#22c55e44'}`,
+        display: 'grid', gridTemplateColumns: `repeat(${GRID_SIZE}, 1fr)`,
+        gridTemplateRows: `repeat(${GRID_SIZE}, 1fr)`, gap: 1, padding: 4,
+        boxSizing: 'border-box', marginBottom: 20,
+      }}>
+        {Array.from({ length: GRID_SIZE * GRID_SIZE }).map((_, idx) => {
+          const x = idx % GRID_SIZE
+          const y = Math.floor(idx / GRID_SIZE)
+          const isHead = snake[0].x === x && snake[0].y === y
+          const isBody = snake.slice(1).some(p => p.x === x && p.y === y)
+          const isFood = food.x === x && food.y === y
 
-                return (
-                  <div
-                    key={`${r}-${c}`}
-                    style={{
-                      background: isHead
-                        ? '#ffaa00'
-                        : isBody
-                          ? '#d97706'
-                          : isFood
-                            ? '#00ff88'
-                            : 'transparent',
-                      borderRadius: isHead || isFood ? '50%' : '2px',
-                      boxShadow: isHead
-                        ? '0 0 8px #ffaa00'
-                        : isFood
-                          ? '0 0 8px #00ff88'
-                          : 'none',
-                    }}
-                  />
-                )
-              })
-            ))}
-          </div>
+          let cellBg = 'transparent'
+          if (isHead) cellBg = '#22c55e'
+          else if (isBody) cellBg = '#16a34a'
+          else if (isFood) cellBg = '#ef4444'
 
-          {/* D-pad controls */}
-          <div style={{
-            display: 'flex',
-            flexDirection: 'column',
-            alignItems: 'center',
-            width: '100%',
-            maxWidth: 160,
-            marginBottom: 10
-          }}>
-            {/* UP button */}
-            <button
-              onClick={() => changeDirection(-1, 0)}
-              className="btn-touch"
+          return (
+            <div
+              key={idx}
               style={{
-                width: 50, height: 50,
-                background: '#12122b', border: '2px solid #ffaa00',
-                borderRadius: 10, color: '#ffaa00', fontSize: 18,
-                cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
-                boxShadow: '0 2px 8px rgba(255, 170, 0, 0.2)', margin: '0 0 6px 0',
-                outline: 'none',
-                WebkitTapHighlightColor: 'transparent',
+                background: cellBg, borderRadius: isHead ? 6 : (isFood ? '50%' : 3),
+                transition: 'background-color 0.1s ease',
               }}
-            >
-              ▲
-            </button>
-            {/* LEFT / RIGHT row */}
-            <div style={{ display: 'flex', gap: 32, justifyContent: 'center', width: '100%' }}>
-              <button
-                onClick={() => changeDirection(0, -1)}
-                className="btn-touch"
-                style={{
-                  width: 50, height: 50,
-                  background: '#12122b', border: '2px solid #ffaa00',
-                  borderRadius: 10, color: '#ffaa00', fontSize: 18,
-                  cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  boxShadow: '0 2px 8px rgba(255, 170, 0, 0.2)',
-                  outline: 'none',
-                  WebkitTapHighlightColor: 'transparent',
-                }}
-              >
-                ◀
-              </button>
-              <button
-                onClick={() => changeDirection(0, 1)}
-                className="btn-touch"
-                style={{
-                  width: 50, height: 50,
-                  background: '#12122b', border: '2px solid #ffaa00',
-                  borderRadius: 10, color: '#ffaa00', fontSize: 18,
-                  cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  boxShadow: '0 2px 8px rgba(255, 170, 0, 0.2)',
-                  outline: 'none',
-                  WebkitTapHighlightColor: 'transparent',
-                }}
-              >
-                ▶
-              </button>
-            </div>
-            {/* DOWN button */}
-            <button
-              onClick={() => changeDirection(1, 0)}
-              className="btn-touch"
-              style={{
-                width: 50, height: 50,
-                background: '#12122b', border: '2px solid #ffaa00',
-                borderRadius: 10, color: '#ffaa00', fontSize: 18,
-                cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
-                boxShadow: '0 2px 8px rgba(255, 170, 0, 0.2)', margin: '6px 0 0 0',
-                outline: 'none',
-                WebkitTapHighlightColor: 'transparent',
-              }}
-            >
-              ▼
-            </button>
-          </div>
-        </div>
-      )}
+            />
+          )
+        })}
+      </div>
 
-      {/* Screen 3: Game Over overlay modal */}
-      {gameState === 'gameover' && (
+      {/* D-Pad Controls for Touch */}
+      <div style={{
+        display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6,
+      }}>
+        <button onClick={() => handlePadClick('UP')} className="btn-touch" style={{
+          width: 54, height: 44, borderRadius: 12, background: isDark ? '#17171c' : '#ffffff',
+          border: `1px solid ${isDark ? '#272730' : '#e5e7eb'}`, fontSize: 18, fontWeight: 'bold', cursor: 'pointer'
+        }}>▲</button>
+        <div style={{ display: 'flex', gap: 24 }}>
+          <button onClick={() => handlePadClick('LEFT')} className="btn-touch" style={{
+            width: 54, height: 44, borderRadius: 12, background: isDark ? '#17171c' : '#ffffff',
+            border: `1px solid ${isDark ? '#272730' : '#e5e7eb'}`, fontSize: 18, fontWeight: 'bold', cursor: 'pointer'
+          }}>◀</button>
+          <button onClick={() => handlePadClick('RIGHT')} className="btn-touch" style={{
+            width: 54, height: 44, borderRadius: 12, background: isDark ? '#17171c' : '#ffffff',
+            border: `1px solid ${isDark ? '#272730' : '#e5e7eb'}`, fontSize: 18, fontWeight: 'bold', cursor: 'pointer'
+          }}>▶</button>
+        </div>
+        <button onClick={() => handlePadClick('DOWN')} className="btn-touch" style={{
+          width: 54, height: 44, borderRadius: 12, background: isDark ? '#17171c' : '#ffffff',
+          border: `1px solid ${isDark ? '#272730' : '#e5e7eb'}`, fontSize: 18, fontWeight: 'bold', cursor: 'pointer'
+        }}>▼</button>
+      </div>
+
+      {/* Game Over Modal */}
+      {gameOver && (
         <div style={{
-          position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
-          background: 'rgba(5, 5, 15, 0.9)',
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-          zIndex: 100, padding: 16
+          position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.8)', backdropFilter: 'blur(4px)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10000, padding: 20
         }}>
           <div style={{
-            background: '#0d0d20',
-            border: `2px solid ${newHighScoreAchieved ? '#00ff88' : '#ffaa00'}`,
-            borderRadius: 20,
-            padding: '32px 24px',
-            width: '100%',
-            maxWidth: 340,
-            textAlign: 'center',
-            boxShadow: `0 0 24px ${newHighScoreAchieved ? '#00ff88' : '#ffaa00'}44`,
-            boxSizing: 'border-box'
+            background: isDark ? '#17171c' : '#ffffff', borderRadius: 24, padding: 24,
+            maxWidth: 340, width: '100%', textAlign: 'center', boxSizing: 'border-box'
           }}>
-            <div style={{ fontSize: 48, marginBottom: 12 }}>
-              {newHighScoreAchieved ? '👑' : '💥'}
-            </div>
-            <h2 style={{
-              color: newHighScoreAchieved ? '#00ff88' : '#ffaa00',
-              fontSize: 18, letterSpacing: 3, textTransform: 'uppercase', margin: '0 0 8px 0',
-              textShadow: `0 0 10px ${newHighScoreAchieved ? '#00ff88' : '#ffaa00'}`
-            }}>
-              {newHighScoreAchieved ? 'NEW RECORD!' : 'GAME OVER!'}
-            </h2>
-            <p style={{ color: '#fff', fontSize: 15, margin: '0 0 24px 0' }}>
-              {p1.toUpperCase()}'S SCORE: <b style={{ color: '#00ff88', fontSize: 20 }}>{score}</b>
+            <div style={{ fontSize: 48, marginBottom: 8 }}>🐍</div>
+            <h2 style={{ fontSize: 22, fontWeight: 800, margin: '0 0 4px 0' }}>Game Over!</h2>
+            <p style={{ fontSize: 14, fontWeight: 700, margin: '0 0 20px 0' }}>
+              Final Score: {score}
             </p>
-
-            <div style={{
-              background: '#12122b', border: '1px solid #20204a',
-              borderRadius: 12, padding: '12px', marginBottom: 24
-            }}>
-              <span style={{ color: '#666', fontSize: 10, letterSpacing: 1, display: 'block', marginBottom: 2 }}>PERSONAL BEST</span>
-              <span style={{ color: '#ffaa00', fontSize: 22, fontWeight: 'bold' }}>{highScore}</span>
-            </div>
-
             <div style={{ display: 'flex', gap: 10 }}>
-              <button onClick={resetAll} className="btn-touch" style={{
-                flex: 1, padding: '14px 12px',
-                background: 'transparent',
-                border: '2px solid #00ff88',
-                borderRadius: 12, color: '#00ff88',
-                fontSize: 11, fontWeight: 900,
-                letterSpacing: 2, textTransform: 'uppercase',
-                cursor: 'pointer',
-                fontFamily: "'Courier New', monospace",
-                outline: 'none',
-                WebkitTapHighlightColor: 'transparent'
+              <button onClick={resetGame} className="btn-touch" style={{
+                flex: 1, padding: '12px', borderRadius: 14, background: isDark ? '#ff453a' : '#ff3b30',
+                border: 'none', color: '#fff', fontSize: 13, fontWeight: 800, cursor: 'pointer'
               }}>
-                ↺ PLAY AGAIN
+                Play Again
               </button>
-              <button onClick={() => router.back()} className="btn-touch" style={{
-                flex: 1, padding: '14px 12px',
-                background: 'transparent',
-                border: '1px solid #334155',
-                borderRadius: 12, color: '#64748b',
-                fontSize: 11, fontWeight: 900,
-                letterSpacing: 2, textTransform: 'uppercase',
-                cursor: 'pointer',
-                fontFamily: "'Courier New', monospace",
-                outline: 'none',
-                WebkitTapHighlightColor: 'transparent'
+              <button onClick={() => router.push('/games')} className="btn-touch" style={{
+                flex: 1, padding: '12px', borderRadius: 14, background: isDark ? '#272730' : '#e5e7eb',
+                border: 'none', color: isDark ? '#fff' : '#111827', fontSize: 13, fontWeight: 800, cursor: 'pointer'
               }}>
-                ← LOBBY
+                Games
               </button>
             </div>
           </div>
         </div>
       )}
 
-      <style jsx global>{`
-        .btn-touch {
-          transition: transform 0.1s ease, filter 0.1s ease !important;
-          -webkit-tap-highlight-color: transparent !important;
-          outline: none !important;
-        }
-        .btn-touch:active {
-          transform: scale(0.94) !important;
-          filter: brightness(0.9) !important;
-        }
-      `}</style>
+      <BottomNav />
     </main>
-  )
-}
-
-export default function Snake() {
-  return (
-    <Suspense fallback={<div style={{ color: '#fff', textAlign: 'center', marginTop: 100 }}>Loading Snake...</div>}>
-      <SnakeContent />
-    </Suspense>
   )
 }

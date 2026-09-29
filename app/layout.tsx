@@ -1,6 +1,7 @@
 import type { Viewport } from 'next'
 import './globals.css'
 import PWAInitializer from './pwa-initializer'
+import { ThemeProvider } from '@/components/ThemeProvider'
 
 export const metadata = {
   title: 'PocketArcadeX',
@@ -17,7 +18,7 @@ export const metadata = {
 }
 
 export const viewport: Viewport = {
-  themeColor: '#0a0a1a',
+  themeColor: '#ff3b30',
   width: 'device-width',
   initialScale: 1,
   maximumScale: 1,
@@ -27,10 +28,17 @@ export const viewport: Viewport = {
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en">
-      <body style={{ margin: 0, padding: 0, background: '#0a0a1a' }}>
-        <PWAInitializer />
-        {children}
+    <html lang="en" suppressHydrationWarning>
+      <body style={{
+        margin: 0,
+        padding: 0,
+        fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif",
+        WebkitFontSmoothing: 'antialiased',
+      }}>
+        <ThemeProvider>
+          <PWAInitializer />
+          {children}
+        </ThemeProvider>
       </body>
     </html>
   )

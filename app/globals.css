@@ -1,3 +1,64 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+:root {
+  --bg-primary: #f8f9fa;
+  --bg-card: #ffffff;
+  --bg-card-subtle: #f2f4f7;
+  --text-primary: #111827;
+  --text-secondary: #6b7280;
+  --border-color: #e5e7eb;
+  --accent-red: #ff3b30;
+  --accent-gradient: linear-gradient(135deg, #ff3b30, #ff5e36);
+  --shadow-soft: 0 4px 20px rgba(0, 0, 0, 0.06);
+  --shadow-card: 0 2px 10px rgba(0, 0, 0, 0.04);
+}
+
+html.dark,
+[data-theme='dark'] {
+  --bg-primary: #0b0b0e;
+  --bg-card: #17171c;
+  --bg-card-subtle: #1e1e26;
+  --text-primary: #f9fafb;
+  --text-secondary: #9ca3af;
+  --border-color: #272730;
+  --accent-red: #ff453a;
+  --accent-gradient: linear-gradient(135deg, #ff453a, #ff6347);
+  --shadow-soft: 0 4px 25px rgba(0, 0, 0, 0.5);
+  --shadow-card: 0 2px 12px rgba(0, 0, 0, 0.4);
+}
+
+body {
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  min-height: 100dvh;
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+  overflow-x: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+/* Touch feedback button animation */
+.btn-touch {
+  transition: transform 0.12s ease, filter 0.12s ease, opacity 0.12s ease !important;
+  -webkit-tap-highlight-color: transparent !important;
+  outline: none !important;
+}
+
+.btn-touch:active {
+  transform: scale(0.96) !important;
+  filter: brightness(0.92) !important;
+}
+
+/* Hide scrollbar for clean horizontal scrolling */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}

@@ -1,8 +1,9 @@
-const fs = require('fs');
-const path = require('path');
+import fs from 'fs';
+import path from 'path';
 
 // Update Service Worker Cache Version
-const swPath = path.join(__dirname, '../public/sw.js');
+// import.meta.dirname is available in Node 20.11+
+const swPath = path.join(import.meta.dirname, '../public/sw.js');
 try {
   let swContent = fs.readFileSync(swPath, 'utf8');
 
@@ -19,8 +20,8 @@ try {
 }
 
 // Copy Apple Touch Icon
-const srcIcon = path.join(__dirname, '../public/icon-192.png');
-const destIcon = path.join(__dirname, '../public/icon-180.png');
+const srcIcon = path.join(import.meta.dirname, '../public/icon-192.png');
+const destIcon = path.join(import.meta.dirname, '../public/icon-180.png');
 try {
   fs.copyFileSync(srcIcon, destIcon);
   console.log('[PWA] Created apple-touch-icon at: public/icon-180.png');
